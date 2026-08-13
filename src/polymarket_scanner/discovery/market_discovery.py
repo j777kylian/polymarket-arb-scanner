@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 
@@ -16,6 +18,7 @@ from polymarket_scanner.database import (
     decimal_to_str,
     record_api_error,
     session_scope,
+    str_to_decimal,
     utcnow,
 )
 from polymarket_scanner.logging_config import get_logger
@@ -73,12 +76,13 @@ def upsert_market(session, market: MarketInfo) -> None:
         else:
             tok.market_id = market.market_id
             tok.outcome = outcome
+    session.flush()
 
     if market.fee_schedule is not None:
         fee = session.scalar(
             select(FeeScheduleRow).where(FeeScheduleRow.market_id == market.market_id)
         )
-        fee_fields = dict(
+        fee_fields: dict[str, Any] = dict(
             rate=decimal_to_str(market.fee_schedule.rate) or "0",
             exponent=decimal_to_str(market.fee_schedule.exponent) or "1",
             taker_only=market.fee_schedule.taker_only,
@@ -93,45 +97,84 @@ def upsert_market(session, market: MarketInfo) -> None:
                 setattr(fee, k, v)
 
 
+def reconcile_unseen_markets(
+    session,
+    seen_ids: set[str],
+    *,
+    full_sync: bool,
+) -> int:
+    """Delist markets missing from a *complete* Gamma snapshot. Limited pages never delist."""
+    if not full_sync:
+        return 0
+    delisted = 0
+    for row in session.scalars(select(MarketRow)).all():
+        if row.market_id not in seen_ids and row.accepting_orders:
+            row.accepting_orders = False
+            row.updated_at = utcnow()
+            delisted += 1
+    if delisted:
+        logger.info("Reconciled %s markets no longer in full Gamma snapshot", delisted)
+    return delisted
+
+
 async def discover_and_store_markets(
     *,
     max_pages: int | None = None,
     enrich_missing_fees: bool = True,
+    reconcile_missing: bool | None = None,
 ) -> list[MarketInfo]:
     """Fetch tradable markets from Gamma, optionally enrich fees via CLOB, upsert DB."""
     async with GammaClient() as gamma:
         markets = await gamma.fetch_tradable_markets(max_pages=max_pages)
 
+    fee_stats = {"successful": 0, "missing": 0, "fallback": 0, "errors": 0}
     if enrich_missing_fees:
         need = [m for m in markets if m.fees_enabled is None or m.fee_schedule is None]
         if need:
+            sem = asyncio.Semaphore(8)
             async with ClobClient() as clob:
-                for m in need[:500]:  # soft cap enrichment volume
-                    try:
-                        enabled, schedule = await clob.get_fee_schedule_for_condition(
-                            m.condition_id
-                        )
-                        if m.fees_enabled is None and enabled is not None:
-                            m.fees_enabled = enabled
-                        if m.fee_schedule is None and schedule is not None:
-                            m.fee_schedule = schedule
-                    except Exception as exc:
-                        logger.warning(
-                            "Fee enrichment failed for %s: %s", m.condition_id, exc
-                        )
-                        with session_scope() as session:
-                            record_api_error(
-                                session,
-                                source="clob",
-                                message=str(exc),
-                                endpoint=f"/clob-markets/{m.condition_id}",
-                            )
 
+                async def enrich(m: MarketInfo) -> None:
+                    async with sem:
+                        try:
+                            enabled, schedule = await clob.get_fee_schedule_for_condition(
+                                m.condition_id
+                            )
+                            if m.fees_enabled is None and enabled is not None:
+                                m.fees_enabled = enabled
+                            if m.fee_schedule is None and schedule is not None:
+                                m.fee_schedule = schedule
+                                fee_stats["successful"] += 1
+                            elif schedule is None:
+                                fee_stats["missing"] += 1
+                                if m.fees_enabled is not False:
+                                    fee_stats["fallback"] += 1
+                        except Exception as exc:
+                            fee_stats["errors"] += 1
+                            logger.warning(
+                                "Fee enrichment failed for %s: %s", m.condition_id, exc
+                            )
+                            with session_scope() as session:
+                                record_api_error(
+                                    session,
+                                    source="clob",
+                                    message=str(exc),
+                                    endpoint=f"/clob-markets/{m.condition_id}",
+                                )
+
+                await asyncio.gather(*(enrich(m) for m in need[:500]))
+        logger.info("Fee enrichment %s", fee_stats)
+
+    full_sync = max_pages is None if reconcile_missing is None else reconcile_missing
     with session_scope() as session:
         for m in markets:
             upsert_market(session, m)
+        if full_sync:
+            reconcile_unseen_markets(
+                session, {m.market_id for m in markets}, full_sync=True
+            )
         session.commit()
-    logger.info("Upserted %s markets", len(markets))
+    logger.info("Upserted %s markets (full_sync=%s)", len(markets), full_sync)
     return markets
 
 
@@ -153,10 +196,10 @@ def load_markets_from_db(*, tradable_only: bool = True) -> list[MarketInfo]:
             fee = None
             if fee_row:
                 fee = FeeSchedule(
-                    rate=fee_row.rate,
-                    exponent=fee_row.exponent,
+                    rate=str_to_decimal(fee_row.rate) or Decimal("0"),
+                    exponent=str_to_decimal(fee_row.exponent) or Decimal("1"),
                     taker_only=fee_row.taker_only,
-                    rebate_rate=fee_row.rebate_rate,
+                    rebate_rate=str_to_decimal(fee_row.rebate_rate) or Decimal("0"),
                 )
             tags = []
             if row.tags_json:
@@ -181,16 +224,16 @@ def load_markets_from_db(*, tradable_only: bool = True) -> list[MarketInfo]:
                     accepting_orders=row.accepting_orders,
                     enable_order_book=row.enable_order_book,
                     neg_risk=row.neg_risk,
-                    minimum_tick_size=row.minimum_tick_size,
-                    minimum_order_size=row.minimum_order_size,
+                    minimum_tick_size=str_to_decimal(row.minimum_tick_size),
+                    minimum_order_size=str_to_decimal(row.minimum_order_size),
                     fees_enabled=row.fees_enabled,
                     fee_schedule=fee,
                     start_date=row.start_date,
                     end_date=row.end_date,
                     resolution_source=row.resolution_source,
                     description=row.description,
-                    volume=row.volume,
-                    liquidity=row.liquidity,
+                    volume=str_to_decimal(row.volume),
+                    liquidity=str_to_decimal(row.liquidity),
                     last_updated=row.last_updated,
                 )
             )

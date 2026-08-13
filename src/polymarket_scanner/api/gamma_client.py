@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, AsyncIterator
@@ -12,6 +11,7 @@ from polymarket_scanner.api.http_base import ReadOnlyHttpClient
 from polymarket_scanner.config import get_config
 from polymarket_scanner.logging_config import get_logger
 from polymarket_scanner.models import FeeSchedule, MarketInfo
+from polymarket_scanner.parse_bool import parse_bool_conservative, parse_strict_bool
 
 logger = get_logger(__name__)
 
@@ -101,10 +101,21 @@ def parse_gamma_market(raw: dict[str, Any]) -> MarketInfo | None:
     # dedupe
     tags = list(dict.fromkeys(tags))
 
-    fees_enabled = raw.get("feesEnabled")
-    if fees_enabled is None:
-        fees_enabled = raw.get("fees_enabled")
+    reasons: list[str] = []
+    fees_enabled = parse_strict_bool(raw.get("feesEnabled", raw.get("fees_enabled")))
     fee_schedule = FeeSchedule.from_api(raw.get("feeSchedule") or raw.get("fee_schedule"))
+    accepting = parse_bool_conservative(
+        raw.get("acceptingOrders", raw.get("accepting_orders")),
+        field="acceptingOrders",
+        reasons=reasons,
+    )
+    enable_ob = parse_bool_conservative(
+        raw.get("enableOrderBook", raw.get("enable_order_book")),
+        field="enableOrderBook",
+        reasons=reasons,
+    )
+    active = parse_strict_bool(raw.get("active"))
+    closed = parse_strict_bool(raw.get("closed"))
 
     return MarketInfo(
         event_id=event_id,
@@ -117,16 +128,16 @@ def parse_gamma_market(raw: dict[str, Any]) -> MarketInfo | None:
         tags=tags,
         yes_token_id=yes_token,
         no_token_id=no_token,
-        active=bool(raw.get("active", True)),
-        closed=bool(raw.get("closed", False)),
-        accepting_orders=bool(raw.get("acceptingOrders", raw.get("accepting_orders", True))),
-        enable_order_book=bool(raw.get("enableOrderBook", raw.get("enable_order_book", True))),
-        neg_risk=bool(raw.get("negRisk", raw.get("neg_risk", False))),
+        active=True if active is None else active,
+        closed=False if closed is None else closed,
+        accepting_orders=accepting,
+        enable_order_book=enable_ob,
+        neg_risk=bool(parse_strict_bool(raw.get("negRisk", raw.get("neg_risk"))) or False),
         minimum_tick_size=_parse_decimal(
             raw.get("orderPriceMinTickSize") or raw.get("minimum_tick_size")
         ),
         minimum_order_size=_parse_decimal(raw.get("orderMinSize") or raw.get("minimum_order_size")),
-        fees_enabled=fees_enabled if fees_enabled is None else bool(fees_enabled),
+        fees_enabled=fees_enabled,
         fee_schedule=fee_schedule,
         start_date=_parse_dt(raw.get("startDate") or raw.get("start_date")),
         end_date=_parse_dt(raw.get("endDate") or raw.get("end_date")),
@@ -136,6 +147,7 @@ def parse_gamma_market(raw: dict[str, Any]) -> MarketInfo | None:
         liquidity=_parse_decimal(raw.get("liquidityNum") or raw.get("liquidity")),
         last_updated=_parse_dt(raw.get("updatedAt") or raw.get("updated_at")),
         raw=raw,
+        parse_reasons=reasons,
     )
 
 

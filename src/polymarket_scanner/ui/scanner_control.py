@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import signal
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal
 
 from filelock import FileLock, Timeout
@@ -152,7 +150,7 @@ def get_scanner_status(ui_proc: subprocess.Popen | None = None) -> ScannerStatus
     msg_parts: list[str] = []
     if lock_held:
         msg_parts.append(f"Lock held ({cfg.scanner.lock_file})")
-    if ui_alive:
+    if ui_alive and ui_proc is not None:
         msg_parts.append(f"UI subprocess pid={ui_proc.pid}")
     if mode:
         msg_parts.append(f"mode={mode} paper={paper}")
@@ -280,8 +278,6 @@ def stop_scanner(
     generate_report: bool = False,
 ) -> tuple[subprocess.Popen | None, str]:
     messages: list[str] = []
-    cfg = get_config()
-    lock_path = cfg.resolve_path(cfg.scanner.lock_file)
 
     if ui_proc and ui_proc.poll() is None:
         ui_proc.terminate()

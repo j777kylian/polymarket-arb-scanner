@@ -75,9 +75,35 @@ def sync_episodes(
                 continue
             row.is_open = False
             row.disappeared_at = now
+            row.close_reason = "signal_gone"
             first = ensure_utc(row.first_seen_at) or now
             now_u = ensure_utc(now) or now
             row.duration_seconds = max(0.0, (now_u - first).total_seconds())
             closed += 1
 
     return ids, {"opened": opened, "closed": closed}
+
+
+def close_episodes(
+    *,
+    market_ids: set[str] | None = None,
+    reason: str,
+    now: datetime | None = None,
+) -> int:
+    """Close open episodes for markets (or all if market_ids is None)."""
+    now = now or utcnow()
+    closed = 0
+    with session_scope() as session:
+        q = select(OpportunityEpisodeRow).where(OpportunityEpisodeRow.is_open.is_(True))
+        rows = session.scalars(q).all()
+        for row in rows:
+            if market_ids is not None and row.market_id not in market_ids:
+                continue
+            row.is_open = False
+            row.disappeared_at = now
+            row.close_reason = reason
+            first = ensure_utc(row.first_seen_at) or now
+            now_u = ensure_utc(now) or now
+            row.duration_seconds = max(0.0, (now_u - first).total_seconds())
+            closed += 1
+    return closed

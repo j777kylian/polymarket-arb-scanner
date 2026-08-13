@@ -20,11 +20,11 @@ ONE = Decimal("1")
 
 def _apply_depth_factor(levels: list[OrderBookLevel], factor: Decimal) -> list[OrderBookLevel]:
     if factor >= ONE:
-        return [OrderBookLevel(price=l.price, size=l.size) for l in levels]
+        return [OrderBookLevel(price=lvl.price, size=lvl.size) for lvl in levels]
     return [
-        OrderBookLevel(price=l.price, size=(l.size * factor))
-        for l in levels
-        if (l.size * factor) > ZERO
+        OrderBookLevel(price=lvl.price, size=(lvl.size * factor))
+        for lvl in levels
+        if (lvl.size * factor) > ZERO
     ]
 
 

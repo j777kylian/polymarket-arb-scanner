@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from decimal import Decimal
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -115,14 +114,14 @@ class ScannerService:
             api_errors += 1
 
         with session_scope() as session:
-            run = session.get(ScannerRunRow, run_id)
-            if run:
-                run.finished_at = utcnow()
-                run.status = status
-                run.markets_synced = markets_synced
-                run.books_fetched = books_fetched
-                run.signals_found = signals_found
-                run.api_errors = api_errors
+            finished = session.get(ScannerRunRow, run_id)
+            if finished is not None:
+                finished.finished_at = utcnow()
+                finished.status = status
+                finished.markets_synced = markets_synced
+                finished.books_fetched = books_fetched
+                finished.signals_found = signals_found
+                finished.api_errors = api_errors
 
         summary = {
             "run_id": run_id,
@@ -138,11 +137,25 @@ class ScannerService:
     def _refresh_cfg(self) -> None:
         self.cfg = apply_runtime_to_config(self.cfg)
 
-    async def run_daemon(self, *, mode: str | None = None, paper: bool = False) -> None:
+    async def run_daemon(
+        self,
+        *,
+        mode: str | None = None,
+        paper: bool = False,
+        max_market_pages: int | None = None,
+        market_limit: int | None = None,
+        sync_markets: bool | None = None,
+    ) -> None:
         assert_trading_disabled()
         setup_logging()
         init_db()
         self._refresh_cfg()
+        if max_market_pages is not None:
+            self.cfg.scanner.max_pages = max_market_pages
+        if market_limit is not None:
+            self.cfg.scanner.market_limit = market_limit
+        if sync_markets is not None:
+            self.cfg.scanner.sync_markets = sync_markets
         mode = (mode or self.cfg.scanner.mode or "static").lower()
         try:
             self._lock.acquire(timeout=0)
@@ -196,15 +209,23 @@ class ScannerService:
                     continue
                 self._refresh_cfg()
                 now = time.time()
-                sync = (now - last_market_sync) >= self.cfg.scanner.market_sync_interval_seconds
+                sync = self.cfg.scanner.sync_markets and (
+                    (now - last_market_sync) >= self.cfg.scanner.market_sync_interval_seconds
+                )
                 try:
-                    await self.run_once(sync_markets=sync, market_limit=None)
+                    await self.run_once(
+                        sync_markets=sync,
+                        market_limit=self.cfg.scanner.market_limit,
+                        max_market_pages=self.cfg.scanner.max_pages,
+                    )
                     if sync:
                         last_market_sync = now
                     if self.cfg.scanner.auto_daily_report:
                         today = utcnow().date().isoformat()
                         if today != last_report_date and utcnow().hour >= self.cfg.reporting.report_hour_utc:
-                            from polymarket_scanner.reporting.html_report import generate_daily_report
+                            from polymarket_scanner.reporting.html_report import (
+                                generate_daily_report,
+                            )
 
                             generate_daily_report(today)
                             last_report_date = today
@@ -244,9 +265,8 @@ def get_dashboard_stats() -> dict[str, Any]:
             )
         ) or 0
         active_ops = session.scalar(
-            select(func.count()).select_from(OpportunityRow).where(
-                OpportunityRow.net_profitable.is_(True),
-                OpportunityRow.stale.is_(False),
+            select(func.count()).select_from(OpportunityEpisodeRow).where(
+                OpportunityEpisodeRow.is_open.is_(True)
             )
         ) or 0
         last_book = session.scalar(
@@ -259,19 +279,6 @@ def get_dashboard_stats() -> dict[str, Any]:
                 ApiErrorRow.created_at >= utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             )
         ) or 0
-
-        def sum_net(col) -> float:
-            rows = session.scalars(
-                select(col).where(
-                    OpportunityRow.discovered_at
-                    >= utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-                )
-            ).all()
-            total = Decimal("0")
-            for v in rows:
-                if v:
-                    total += Decimal(v)
-            return float(total)
 
         open_eps = session.scalar(
             select(func.count()).select_from(OpportunityEpisodeRow).where(
@@ -294,26 +301,50 @@ def get_dashboard_stats() -> dict[str, Any]:
                 p50 <= cfg.scanner.latency_sufficient_p50_ms
                 and p95 <= cfg.scanner.latency_sufficient_p95_ms
             )
+        qualified_today = session.scalar(
+            select(func.count()).select_from(OpportunityRow).where(
+                OpportunityRow.discovered_at
+                >= utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+                OpportunityRow.passes_rule_set.is_(True),
+                OpportunityRow.net_profitable.is_(True),
+            )
+        ) or 0
+        episode_first_today = session.scalar(
+            select(func.count()).select_from(OpportunityEpisodeRow).where(
+                OpportunityEpisodeRow.first_seen_at
+                >= utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            )
+        ) or 0
+
         paper = session.scalar(select(PaperAccountRow).limit(1))
         paper_trades = session.scalar(select(func.count()).select_from(PaperTradeRow)) or 0
+        paper_realized = paper.realized_pnl if paper else None
 
         return {
             "markets": markets,
             "last_run_started_at": ensure_utc(last_run.started_at) if last_run else None,
             "last_run_status": last_run.status if last_run else None,
             "signals_today": todays,
+            "raw_signals_today": todays,
+            "qualified_today": qualified_today,
+            "qualified_episodes_today": episode_first_today,
             "active_opportunities": active_ops,
             "open_episodes": open_eps,
             "last_book_at": ensure_utc(last_book.fetched_at) if last_book else None,
             "api_errors_today": api_errors_today,
-            "optimistic_profit_today": sum_net(OpportunityRow.optimistic_net),
-            "base_profit_today": sum_net(OpportunityRow.base_net),
-            "pessimistic_profit_today": sum_net(OpportunityRow.pessimistic_net),
+            "optimistic_profit_today": 0.0,
+            "base_profit_today": 0.0,
+            "pessimistic_profit_today": 0.0,
+            "theoretical_note": (
+                "Do not sum per-tick base_net. Theoretical opportunity count uses "
+                "first-seen episodes; realized P&L is paper only."
+            ),
             "latency_p50_ms": p50,
             "latency_p95_ms": p95,
             "latency_sufficient": sufficient,
             "paper_cash": paper.cash if paper else None,
-            "paper_pnl": paper.realized_pnl if paper else None,
+            "paper_pnl": paper_realized,
+            "paper_realized_pnl": paper_realized,
             "paper_trades": paper_trades,
             "date": today,
         }

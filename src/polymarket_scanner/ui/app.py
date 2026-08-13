@@ -16,13 +16,11 @@ from sqlalchemy import desc, select
 from polymarket_scanner.config import get_config
 from polymarket_scanner.database import (
     DailyReportRow,
-    MarketRow,
     OpportunityEpisodeRow,
     OpportunityRow,
     PaperTradeRow,
     SimulationRunRow,
     ensure_utc,
-    get_setting,
     init_db,
     session_scope,
     set_setting,
@@ -46,6 +44,8 @@ from polymarket_scanner.scanners.rule_engine import (
     save_rule_set,
 )
 from polymarket_scanner.scheduler import get_dashboard_stats
+from polymarket_scanner.simulation.execution_simulator import simulate_forward
+from polymarket_scanner.simulation.scenario_profiles import ScenarioProfile
 from polymarket_scanner.ui.scanner_control import (
     PhaseParams,
     build_daemon_cmd,
@@ -57,8 +57,6 @@ from polymarket_scanner.ui.scanner_control import (
     start_phase_daemon,
     stop_scanner,
 )
-from polymarket_scanner.simulation.execution_simulator import simulate_forward
-from polymarket_scanner.simulation.scenario_profiles import ScenarioProfile, get_builtin_profiles
 
 assert_trading_disabled()
 setup_logging()
@@ -124,14 +122,18 @@ def _run_async(coro):
 def _render_metrics(stats: dict) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Monitored markets", stats["markets"])
-    c2.metric("Active opportunities", stats["active_opportunities"])
-    c3.metric("Signals today", stats["signals_today"])
+    c2.metric("Open episodes (active)", stats["active_opportunities"])
+    c3.metric("Raw signals today", stats.get("raw_signals_today", stats["signals_today"]))
     c4.metric("API errors today", stats["api_errors_today"])
 
     c5, c6, c7 = st.columns(3)
-    c5.metric("Optimistic profit (today, theoretical)", f"{stats['optimistic_profit_today']:.4f}")
-    c6.metric("Base profit (today, simulated)", f"{stats['base_profit_today']:.4f}")
-    c7.metric("Pessimistic profit (today, simulated)", f"{stats['pessimistic_profit_today']:.4f}")
+    c5.metric("Qualified signals today", stats.get("qualified_today") or 0)
+    c6.metric("First-seen episodes today", stats.get("qualified_episodes_today") or 0)
+    c7.metric("Paper realized P&L", str(stats.get("paper_realized_pnl") or stats.get("paper_pnl") or "0"))
+    st.caption(
+        "Active = currently open episodes, not historical OpportunityRow rows. "
+        "Do not treat summed per-tick base_net as profit. Paper P&L is simulated only."
+    )
 
     l1, l2, l3, l4 = st.columns(4)
     l1.metric("Open episodes", stats.get("open_episodes") or 0)
@@ -520,6 +522,8 @@ def page_opportunities() -> None:
                     "quality": o.simulation_quality,
                     "data_age": o.data_age_seconds,
                     "stale": o.stale,
+                    "passes_rule": o.passes_rule_set,
+                    "books_ready": getattr(o, "books_ready", True),
                     "tags": o.risk_tags_json,
                 }
             )
@@ -555,7 +559,6 @@ def page_simulator() -> None:
         return
     choice = st.selectbox("Market", list(labels.keys()))
     m = labels[choice]
-    profiles = get_builtin_profiles()
     col1, col2, col3 = st.columns(3)
     qty = Decimal(str(col1.number_input("Target quantity", min_value=0.0, value=50.0)))
     delay = int(col2.number_input("Delay ms", min_value=0, value=500))
@@ -590,6 +593,13 @@ def page_simulator() -> None:
         result = simulate_forward(
             m, yes_book, no_book, profile, target_quantity=qty if qty > 0 else None
         )
+        if result.quality.value != "observed_snapshot":
+            st.warning(
+                f"Simulation quality = **{result.quality.value}** (not a real delayed observation). "
+                "No matching historical snapshot was found in the delay window; this is an estimate."
+            )
+        else:
+            st.success("Used observed delayed snapshots from stored books (still simulated, not live fills).")
         st.json(json.loads(result.model_dump_json()))
         st.write(result.details)
         with session_scope() as session:

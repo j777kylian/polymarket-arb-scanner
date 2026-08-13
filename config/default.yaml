@@ -29,6 +29,9 @@ scanner:
   ws_recalc_debounce_ms: 75
   latency_sufficient_p50_ms: 200
   latency_sufficient_p95_ms: 500
+  max_book_skew_ms: 250
+  observed_delay_tolerance_ms: 250
+  ws_persist_min_interval_ms: 400
 
 paper:
   enabled: false

@@ -40,7 +40,15 @@ def main() -> None:
 
     service = ScannerService()
     if args.daemon or args.mode == "realtime":
-        asyncio.run(service.run_daemon(mode=args.mode, paper=args.paper))
+        asyncio.run(
+            service.run_daemon(
+                mode=args.mode,
+                paper=args.paper,
+                max_market_pages=args.max_pages,
+                market_limit=args.market_limit,
+                sync_markets=not args.no_sync,
+            )
+        )
     else:
         summary = asyncio.run(
             service.run_once(

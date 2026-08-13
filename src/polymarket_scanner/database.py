@@ -6,11 +6,9 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     DateTime,
     Float,
@@ -154,6 +152,8 @@ class OrderBookSnapshotRow(Base):
     min_order_size: Mapped[str | None] = mapped_column(String(32), nullable=True)
     neg_risk: Mapped[bool] = mapped_column(Boolean, default=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    connection_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     levels: Mapped[list[OrderBookLevelRow]] = relationship(
@@ -207,6 +207,15 @@ class OpportunityRow(Base):
     simulation_quality: Mapped[str | None] = mapped_column(String(32), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    passes_rule_set: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    rule_set_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rule_set_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    books_ready: Mapped[bool] = mapped_column(Boolean, default=True)
+    book_skew_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    optimistic_quality: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    base_quality: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    pessimistic_quality: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class SimulationRunRow(Base):
@@ -225,6 +234,9 @@ class SimulationRunRow(Base):
     net_profit: Mapped[str] = mapped_column(String(32))
     worst_loss: Mapped[str] = mapped_column(String(32), default="0")
     unhedged_quantity: Mapped[str] = mapped_column(String(32), default="0")
+    remaining_inventory: Mapped[str] = mapped_column(String(32), default="0")
+    realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    unrealized_inventory_cost: Mapped[str] = mapped_column(String(32), default="0")
     still_arbitrage: Mapped[bool] = mapped_column(Boolean, default=False)
     one_leg_risk: Mapped[bool] = mapped_column(Boolean, default=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -259,6 +271,7 @@ class RuleSetRow(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     logic: Mapped[str] = mapped_column(String(8), default="AND")
+    version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -362,6 +375,7 @@ class OpportunityEpisodeRow(Base):
     last_net_profit: Mapped[str] = mapped_column(String(32), default="0")
     last_quantity: Mapped[str] = mapped_column(String(32), default="0")
     last_opportunity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class LatencySampleRow(Base):
@@ -404,6 +418,11 @@ class PaperTradeRow(Base):
     merge_proceeds: Mapped[str] = mapped_column(String(32), default="0")
     pnl: Mapped[str] = mapped_column(String(32), default="0")
     cash_after: Mapped[str] = mapped_column(String(32), default="0")
+    remaining_inventory: Mapped[str] = mapped_column(String(32), default="0")
+    inventory_cost: Mapped[str] = mapped_column(String(32), default="0")
+    sell_proceeds: Mapped[str] = mapped_column(String(32), default="0")
+    buy_fees: Mapped[str] = mapped_column(String(32), default="0")
+    sell_fees: Mapped[str] = mapped_column(String(32), default="0")
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -498,9 +517,46 @@ DEFAULT_RULE_SETS: list[dict[str, Any]] = [
 ]
 
 
+def _ensure_schema(engine) -> None:
+    """SQLite create_all does not add new columns to existing tables."""
+    specs: list[tuple[str, str, str]] = [
+        ("opportunities", "episode_id", "INTEGER"),
+        ("opportunities", "passes_rule_set", "BOOLEAN"),
+        ("opportunities", "rule_set_id", "INTEGER"),
+        ("opportunities", "rule_set_version", "INTEGER"),
+        ("opportunities", "books_ready", "BOOLEAN DEFAULT 1"),
+        ("opportunities", "book_skew_ms", "FLOAT"),
+        ("opportunities", "optimistic_quality", "VARCHAR(32)"),
+        ("opportunities", "base_quality", "VARCHAR(32)"),
+        ("opportunities", "pessimistic_quality", "VARCHAR(32)"),
+        ("opportunity_episodes", "close_reason", "VARCHAR(64)"),
+        ("rule_sets", "version", "INTEGER DEFAULT 1"),
+        ("paper_trades", "remaining_inventory", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "inventory_cost", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "sell_proceeds", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "buy_fees", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "sell_fees", "VARCHAR(32) DEFAULT '0'"),
+        ("orderbook_snapshots", "last_seen_at", "DATETIME"),
+        ("orderbook_snapshots", "connection_generation", "INTEGER"),
+        ("simulation_runs", "remaining_inventory", "VARCHAR(32) DEFAULT '0'"),
+        ("simulation_runs", "realized_pnl", "VARCHAR(32) DEFAULT '0'"),
+        ("simulation_runs", "unrealized_inventory_cost", "VARCHAR(32) DEFAULT '0'"),
+    ]
+    with engine.begin() as conn:
+        for table, column, ddl in specs:
+            rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            existing = {r[1] for r in rows} if rows else set()
+            if rows and column not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
 def init_db(url: str | None = None) -> None:
     engine = get_engine(url)
     Base.metadata.create_all(engine)
+    try:
+        _ensure_schema(engine)
+    except Exception:
+        logger.exception("Schema patch failed")
     with session_scope(url) as session:
         existing = {r.name for r in session.scalars(select(RuleSetRow)).all()}
         for rs in DEFAULT_RULE_SETS:

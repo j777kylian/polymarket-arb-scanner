@@ -14,7 +14,6 @@ from pydantic import BaseModel, Field
 
 from polymarket_scanner.safety import TRADING_ENABLED, assert_trading_disabled
 
-
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT_DIR / "config"
 
@@ -46,6 +45,12 @@ class ScannerConfig(BaseModel):
     ws_recalc_debounce_ms: int = 75
     latency_sufficient_p50_ms: float = 200.0
     latency_sufficient_p95_ms: float = 500.0
+    max_book_skew_ms: float = 250.0
+    observed_delay_tolerance_ms: float = 250.0
+    max_pages: int | None = None
+    market_limit: int | None = None
+    sync_markets: bool = True
+    ws_persist_min_interval_ms: int = 400
 
 
 class PaperConfig(BaseModel):

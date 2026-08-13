@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from sqlalchemy import select
+
 from polymarket_scanner.database import OpportunityEpisodeRow, init_db, session_scope
 from polymarket_scanner.models import ArbDirection, OpportunitySignal
 from polymarket_scanner.scanners.opportunity_tracker import sync_episodes
-from sqlalchemy import select
 
 
 def _sig(now: datetime) -> OpportunitySignal:

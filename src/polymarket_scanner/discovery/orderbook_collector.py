@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta
 
 from sqlalchemy import desc, select
 
@@ -38,6 +37,9 @@ def persist_orderbook(session, book: OrderBookSnapshot, *, skip_duplicate_hash: 
             .limit(1)
         )
         if existing is not None:
+            existing.last_seen_at = book.fetched_at or utcnow()
+            if book.connection_generation is not None:
+                existing.connection_generation = book.connection_generation
             return existing.id
 
     row = OrderBookSnapshotRow(
@@ -50,6 +52,8 @@ def persist_orderbook(session, book: OrderBookSnapshot, *, skip_duplicate_hash: 
         min_order_size=decimal_to_str(book.min_order_size),
         neg_risk=book.neg_risk,
         fetched_at=book.fetched_at,
+        last_seen_at=book.fetched_at,
+        connection_generation=book.connection_generation,
         raw_json=json.dumps(book.raw) if book.raw else None,
     )
     session.add(row)
@@ -126,6 +130,31 @@ def latest_books_for_market(
         return latest(yes_token), latest(no_token)
 
 
+def snapshot_in_window(
+    token_id: str,
+    *,
+    target: datetime,
+    tolerance_ms: float,
+) -> OrderBookSnapshot | None:
+    """Return a snapshot with target <= fetched_at <= target + tolerance."""
+    end = target + timedelta(milliseconds=tolerance_ms)
+    with session_scope() as session:
+        row = session.scalar(
+            select(OrderBookSnapshotRow)
+            .where(
+                OrderBookSnapshotRow.token_id == token_id,
+                OrderBookSnapshotRow.fetched_at >= target,
+                OrderBookSnapshotRow.fetched_at <= end,
+            )
+            .order_by(OrderBookSnapshotRow.fetched_at)
+            .limit(1)
+        )
+        if row is None:
+            return None
+        _ = row.levels
+        return row_to_snapshot(row)
+
+
 async def fetch_books_for_market(
     clob: ClobClient,
     market: MarketInfo,
@@ -173,7 +202,7 @@ async def collect_orderbooks(
         fetched = await asyncio.gather(*tasks, return_exceptions=True)
         with session_scope() as session:
             for market, item in zip(markets, fetched):
-                if isinstance(item, Exception):
+                if not isinstance(item, tuple):
                     logger.error("Book collect failed for %s: %s", market.market_id, item)
                     results[market.market_id] = (None, None)
                     record_api_error(session, source="clob", message=str(item))

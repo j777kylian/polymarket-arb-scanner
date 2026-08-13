@@ -90,7 +90,7 @@ def test_fees_eliminate_profit() -> None:
     # Tiny edge: 0.495 + 0.495 = 0.99 => 0.01 gross/share
     yes = _book(OutcomeSide.YES, [("0.495", "100")])
     no = _book(OutcomeSide.NO, [("0.495", "100")])
-    walk = find_optimal_forward_arb(
+    find_optimal_forward_arb(
         yes, no, schedule, fees_enabled=True, operational_cost=Decimal("0"), safety_buffer=Decimal("0")
     )
     # Crypto fee at ~0.495 for 100 shares is large vs 1.00 gross

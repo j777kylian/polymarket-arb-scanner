@@ -199,16 +199,48 @@ def load_rule_sets_from_db() -> list[RuleSetModel]:
     return out
 
 
+def get_enabled_rule_set_meta(
+    name: str | None = None,
+) -> tuple[RuleSetModel | None, int | None, int | None]:
+    """Return (model, rule_set_id, version) for the active rule set."""
+    with session_scope() as session:
+        rows = session.scalars(select(RuleSetRow)).all()
+        chosen = None
+        if name:
+            chosen = next((r for r in rows if r.name == name), None)
+        if chosen is None:
+            chosen = next((r for r in rows if r.enabled), None)
+        if chosen is None and rows:
+            chosen = rows[0]
+        if chosen is None:
+            return None, None, None
+        conditions = []
+        for rule in sorted(chosen.rules, key=lambda r: r.sort_order):
+            try:
+                value = json.loads(rule.value_json)
+            except json.JSONDecodeError:
+                value = rule.value_json
+            conditions.append(
+                RuleCondition(
+                    field=rule.field,
+                    operator=rule.operator,
+                    value=value,
+                    enabled=rule.enabled,
+                )
+            )
+        model = RuleSetModel(
+            name=chosen.name,
+            enabled=chosen.enabled,
+            description=chosen.description,
+            logic=chosen.logic,
+            conditions=conditions,
+        )
+        return model, chosen.id, int(getattr(chosen, "version", 1) or 1)
+
+
 def get_enabled_rule_set(name: str | None = None) -> RuleSetModel | None:
-    sets = load_rule_sets_from_db()
-    if name:
-        for rs in sets:
-            if rs.name == name:
-                return rs
-    for rs in sets:
-        if rs.enabled:
-            return rs
-    return sets[0] if sets else None
+    model, _rid, _ver = get_enabled_rule_set_meta(name)
+    return model
 
 
 def save_rule_set(rule_set: RuleSetModel) -> None:
@@ -228,6 +260,7 @@ def save_rule_set(rule_set: RuleSetModel) -> None:
             row.description = rule_set.description
             row.logic = rule_set.logic
             row.updated_at = utcnow()
+            row.version = int(getattr(row, "version", 1) or 1) + 1
             for old in list(row.rules):
                 session.delete(old)
             session.flush()

@@ -71,6 +71,7 @@ def scan_binary_market(
     operational_cost: Decimal | None = None,
     safety_buffer: Decimal | None = None,
     now: datetime | None = None,
+    books_ready: bool = True,
 ) -> list[OpportunitySignal]:
     """Detect forward (and flag reverse) complete-set opportunities for one market."""
     cfg = get_config()
@@ -93,6 +94,11 @@ def scan_binary_market(
 
     age = max(_age_seconds(yes_book.fetched_at, now), _age_seconds(no_book.fetched_at, now))
     stale = age > max_age
+    skew_ms = abs((yes_book.fetched_at - no_book.fetched_at).total_seconds() * 1000.0)
+    max_skew = float(cfg.scanner.max_book_skew_ms)
+    skewed = skew_ms > max_skew
+    if not books_ready:
+        return []
 
     schedule: FeeSchedule | None = market.fee_schedule
     fees_enabled = market.fees_enabled
@@ -124,6 +130,12 @@ def scan_binary_market(
         if market.fees_enabled is not False and market.fee_schedule is None:
             tags.append("fee schedule missing")
 
+        if skewed:
+            tags.append("book skew")
+        min_sz = market.minimum_order_size or yes_book.min_order_size or Decimal("5")
+        if walk.quantity < min_sz:
+            tags.append("below min order size")
+
         signals.append(
             OpportunitySignal(
                 market_id=market.market_id,
@@ -148,6 +160,9 @@ def scan_binary_market(
                 risk_tags=tags,
                 walk=walk,
                 requires_split_inventory=False,
+                books_ready=books_ready,
+                book_skew_ms=skew_ms,
+                books_skewed=skewed,
             )
         )
 
@@ -186,6 +201,9 @@ def scan_binary_market(
                 risk_tags=tags,
                 walk=None,
                 requires_split_inventory=True,
+                books_ready=books_ready,
+                book_skew_ms=skew_ms,
+                books_skewed=skewed,
             )
         )
 

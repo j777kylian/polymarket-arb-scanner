@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -34,13 +35,18 @@ class ReadOnlyHttpClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout if timeout is not None else cfg.api.http_timeout_seconds
         self._client: httpx.AsyncClient | None = None
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("ALL_PROXY")
+        kwargs: dict[str, Any] = {
+            "base_url": self.base_url,
+            "timeout": self.timeout,
+            "headers": {"Accept": "application/json", "User-Agent": "polymarket-arb-scanner/0.1"},
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        self._client_kwargs = kwargs
 
     async def __aenter__(self) -> ReadOnlyHttpClient:
-        self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            headers={"Accept": "application/json", "User-Agent": "polymarket-arb-scanner/0.1"},
-        )
+        self._client = httpx.AsyncClient(**self._client_kwargs)
         return self
 
     async def __aexit__(self, *args: Any) -> None:

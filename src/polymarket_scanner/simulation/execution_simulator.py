@@ -49,22 +49,35 @@ def select_delayed_books(
     delay_ms: int,
     yes_later: OrderBookSnapshot | None = None,
     no_later: OrderBookSnapshot | None = None,
+    tolerance_ms: float | None = None,
+    max_skew_ms: float | None = None,
 ) -> tuple[OrderBookSnapshot, OrderBookSnapshot, SimulationQuality]:
+    from polymarket_scanner.config import get_config
+
+    cfg = get_config().scanner
+    tolerance = float(tolerance_ms if tolerance_ms is not None else cfg.observed_delay_tolerance_ms)
+    max_skew = float(max_skew_ms if max_skew_ms is not None else cfg.max_book_skew_ms)
+
     if delay_ms <= 0:
         return yes_t0, no_t0, SimulationQuality.OBSERVED_SNAPSHOT
     if yes_later is None or no_later is None:
         return yes_t0, no_t0, SimulationQuality.ESTIMATED
 
-    target = yes_t0.fetched_at + timedelta(milliseconds=delay_ms)
-    window = timedelta(milliseconds=max(delay_ms * 2, 1000))
+    target_y = yes_t0.fetched_at + timedelta(milliseconds=delay_ms)
+    target_n = no_t0.fetched_at + timedelta(milliseconds=delay_ms)
 
-    def ok(book: OrderBookSnapshot) -> bool:
-        delta = abs((book.fetched_at - target).total_seconds())
-        return delta <= window.total_seconds() or book.fetched_at >= target
+    def in_window(book: OrderBookSnapshot, target) -> bool:
+        end = target + timedelta(milliseconds=tolerance)
+        return target <= book.fetched_at <= end
 
-    if ok(yes_later) and ok(no_later):
-        return yes_later, no_later, SimulationQuality.OBSERVED_SNAPSHOT
-    return yes_t0, no_t0, SimulationQuality.ESTIMATED
+    if not in_window(yes_later, target_y) or not in_window(no_later, target_n):
+        too_old = yes_later.fetched_at < target_y or no_later.fetched_at < target_n
+        return yes_t0, no_t0, SimulationQuality.STALE if too_old else SimulationQuality.ESTIMATED
+
+    skew_ms = abs((yes_later.fetched_at - no_later.fetched_at).total_seconds() * 1000.0)
+    if skew_ms > max_skew:
+        return yes_t0, no_t0, SimulationQuality.UNAVAILABLE
+    return yes_later, no_later, SimulationQuality.OBSERVED_SNAPSHOT
 
 
 def _prepare_asks(book: OrderBookSnapshot, profile: ScenarioProfile) -> list:
@@ -136,6 +149,30 @@ def simulate_forward(
     """Simulate buying YES+NO under a scenario profile."""
     schedule: FeeSchedule | None = market.fee_schedule
     fees_enabled = market.fees_enabled
+    if (
+        profile.delay_ms > 0
+        and (yes_delayed is None or no_delayed is None)
+        and yes_t0.token_id
+        and no_t0.token_id
+    ):
+        try:
+            from polymarket_scanner.config import get_config
+            from polymarket_scanner.discovery.orderbook_collector import snapshot_in_window
+
+            tol = get_config().scanner.observed_delay_tolerance_ms
+            target_y = yes_t0.fetched_at + timedelta(milliseconds=profile.delay_ms)
+            target_n = no_t0.fetched_at + timedelta(milliseconds=profile.delay_ms)
+            if yes_delayed is None:
+                yes_delayed = snapshot_in_window(
+                    yes_t0.token_id, target=target_y, tolerance_ms=tol
+                )
+            if no_delayed is None:
+                no_delayed = snapshot_in_window(
+                    no_t0.token_id, target=target_n, tolerance_ms=tol
+                )
+        except Exception:
+            pass
+
     yes_exec, no_exec, quality = select_delayed_books(
         yes_t0,
         no_t0,
@@ -181,10 +218,10 @@ def simulate_forward(
     first_side = OutcomeSide.YES if profile.first_leg.upper() == "YES" else OutcomeSide.NO
     if first_side == OutcomeSide.YES:
         first_asks, second_asks = yes_asks, no_asks
-        first_label, second_label = OutcomeSide.YES, OutcomeSide.NO
+        first_label = OutcomeSide.YES
     else:
         first_asks, second_asks = no_asks, yes_asks
-        first_label, second_label = OutcomeSide.NO, OutcomeSide.YES
+        first_label = OutcomeSide.NO
 
     # First leg
     f_filled, _, _, f_fills, _ = walk_buy_asks(
@@ -237,39 +274,61 @@ def simulate_forward(
 
     close_leg: SimulationLegResult | None = None
     worst_loss = ZERO
+    remaining_inventory = ZERO
+    unrealized_inventory_cost = ZERO
+    close_realized = ZERO
     if one_leg and profile.force_close_unhedged and unhedged > ZERO:
         if yes_qty > no_qty:
             close_book, close_side, long_fills = yes_exec, OutcomeSide.YES, yes_fills
         else:
             close_book, close_side, long_fills = no_exec, OutcomeSide.NO, no_fills
-        extra_cost, _ = _cost_for_qty(long_fills, unhedged, from_end=True)
+        extra_cost, extra_buy_fee = _cost_for_qty(long_fills, unhedged, from_end=True)
         bids = _prepare_bids(close_book, profile)
         c_filled, proceeds, c_fees, c_fills, _ = walk_sell_bids(
             bids, unhedged, schedule, fees_enabled=fees_enabled, is_taker=True
         )
-        close_pnl = proceeds - extra_cost - c_fees
-        worst_loss = min(ZERO, close_pnl)
-        fees += c_fees
-        gross += proceeds - extra_cost
+        if unhedged > ZERO and c_filled > ZERO:
+            frac = c_filled / unhedged
+        else:
+            frac = ZERO
+        closed_cost = extra_cost * frac
+        closed_buy_fee = extra_buy_fee * frac
+        close_realized = proceeds - closed_cost - closed_buy_fee - c_fees
+        worst_loss = min(ZERO, close_realized)
+        fees += c_fees + closed_buy_fee
+        gross += proceeds - closed_cost
         close_leg = _leg_from_fills(close_side, "close", c_fills)
-        unhedged = unhedged - c_filled
+        remaining_inventory = unhedged - c_filled
+        leftover_frac = (unhedged - c_filled) / unhedged if unhedged else ZERO
+        unrealized_inventory_cost = (extra_cost + extra_buy_fee) * leftover_frac
+        unhedged = remaining_inventory
     elif one_leg:
         # Mark potential loss if forced to exit at opposite best bid without executing
         if yes_qty > no_qty and yes_exec.bids:
             mark = yes_exec.bids[0].price
-            extra_cost, _ = _cost_for_qty(yes_fills, unhedged, from_end=True)
-            worst_loss = min(ZERO, mark * unhedged - extra_cost)
+            extra_cost, extra_buy_fee = _cost_for_qty(yes_fills, unhedged, from_end=True)
+            worst_loss = min(ZERO, mark * unhedged - extra_cost - extra_buy_fee)
+            remaining_inventory = unhedged
+            unrealized_inventory_cost = extra_cost + extra_buy_fee
         elif no_qty > yes_qty and no_exec.bids:
             mark = no_exec.bids[0].price
-            extra_cost, _ = _cost_for_qty(no_fills, unhedged, from_end=True)
-            worst_loss = min(ZERO, mark * unhedged - extra_cost)
+            extra_cost, extra_buy_fee = _cost_for_qty(no_fills, unhedged, from_end=True)
+            worst_loss = min(ZERO, mark * unhedged - extra_cost - extra_buy_fee)
+            remaining_inventory = unhedged
+            unrealized_inventory_cost = extra_cost + extra_buy_fee
 
     net = gross - fees - profile.operational_cost - profile.safety_buffer
+    # Remaining inventory cost is not realized P&L; net already excludes leftover acquisition.
+    realized_pnl = net
     still = matched > ZERO and (yes_matched_cost + no_matched_cost) < matched
 
     tags: list[str] = []
     if quality == SimulationQuality.ESTIMATED:
         tags.append("estimated simulation")
+    if quality == SimulationQuality.STALE:
+        tags.append("stale delayed snapshot")
+    if quality == SimulationQuality.UNAVAILABLE:
+        tags.append("observed delay unavailable")
     if one_leg:
         tags.append("one-leg risk")
     if profile.delay_ms > 0:
@@ -298,9 +357,16 @@ def simulate_forward(
         legs=legs,
         details=(
             f"profile={profile.name} quality={quality.value} matched={matched} "
-            f"unhedged={unhedged} delay_ms={profile.delay_ms}"
+            f"unhedged={unhedged} delay_ms={profile.delay_ms} realized={realized_pnl} "
+            f"remaining={remaining_inventory} t0_yes_hash={yes_t0.hash} "
+            f"t0_no_hash={no_t0.hash} t0_yes_at={yes_t0.fetched_at.isoformat()} "
+            f"t0_no_at={no_t0.fetched_at.isoformat()} "
+            f"t0_gen={yes_t0.connection_generation}/{no_t0.connection_generation}"
         ),
         risk_tags=tags,
+        realized_pnl=realized_pnl,
+        unrealized_inventory_cost=unrealized_inventory_cost,
+        remaining_inventory=remaining_inventory,
     )
 
 

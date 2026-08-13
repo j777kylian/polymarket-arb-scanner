@@ -9,7 +9,6 @@ import pytest
 from polymarket_scanner.models import FeeSchedule
 from polymarket_scanner.simulation.fee_calculator import calculate_taker_fee, round_fee
 
-
 CRYPTO = FeeSchedule(rate=Decimal("0.07"), exponent=Decimal("1"), taker_only=True, rebate_rate=Decimal("0.2"))
 SPORTS = FeeSchedule(rate=Decimal("0.05"), exponent=Decimal("1"), taker_only=True, rebate_rate=Decimal("0.15"))
 FINANCE = FeeSchedule(rate=Decimal("0.04"), exponent=Decimal("1"), taker_only=True, rebate_rate=Decimal("0.25"))

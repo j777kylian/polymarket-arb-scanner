@@ -23,6 +23,8 @@ class ArbDirection(str, Enum):
 class SimulationQuality(str, Enum):
     OBSERVED_SNAPSHOT = "observed_snapshot"
     ESTIMATED = "estimated"
+    UNAVAILABLE = "unavailable"
+    STALE = "stale"
 
 
 class SimulationProfileName(str, Enum):
@@ -100,6 +102,7 @@ class OrderBookSnapshot(BaseModel):
     neg_risk: bool = False
     fetched_at: datetime
     raw: dict[str, Any] | None = None
+    connection_generation: int | None = None
 
     @property
     def best_bid(self) -> Decimal | None:
@@ -142,6 +145,7 @@ class MarketInfo(BaseModel):
     liquidity: Decimal | None = None
     last_updated: datetime | None = None
     raw: dict[str, Any] | None = None
+    parse_reasons: list[str] = Field(default_factory=list)
 
     @property
     def is_binary_tradable(self) -> bool:
@@ -206,6 +210,10 @@ class OpportunitySignal(BaseModel):
     risk_tags: list[str] = Field(default_factory=list)
     walk: WalkResult | None = None
     requires_split_inventory: bool = False
+    books_ready: bool = True
+    book_skew_ms: float | None = None
+    books_skewed: bool = False
+    passes_rule_set: bool | None = None
 
 
 class SimulationLegResult(BaseModel):
@@ -234,6 +242,9 @@ class SimulationResult(BaseModel):
     legs: list[SimulationLegResult] = Field(default_factory=list)
     details: str = ""
     risk_tags: list[str] = Field(default_factory=list)
+    realized_pnl: Decimal = Decimal("0")
+    unrealized_inventory_cost: Decimal = Decimal("0")
+    remaining_inventory: Decimal = Decimal("0")
 
 
 class RuleCondition(BaseModel):

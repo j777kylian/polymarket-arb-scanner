@@ -5,13 +5,12 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 from jinja2 import Template
 from sqlalchemy import select
 
-from polymarket_scanner.config import ROOT_DIR, get_config
+from polymarket_scanner.config import get_config
 from polymarket_scanner.database import DailyReportRow, OpportunityRow, session_scope, utcnow
 from polymarket_scanner.logging_config import get_logger
 
@@ -55,16 +54,17 @@ HTML_TEMPLATE = Template(
     <div class="stat"><div>Net profitable</div><div class="n">{{ net_signals }}</div></div>
     <div class="stat"><div>Base profitable</div><div class="n">{{ base_profitable }}</div></div>
     <div class="stat"><div>Pessimistic profitable</div><div class="n">{{ pessimistic_profitable }}</div></div>
-    <div class="stat"><div>Sim total profit (Base)</div><div class="n">{{ total_sim_profit }}</div></div>
+    <div class="stat"><div>Paper realized P&amp;L (simulated)</div><div class="n">{{ total_sim_profit }}</div></div>
+    <div class="stat"><div>Qualified episodes (first-seen)</div><div class="n">{{ qualified_episodes }}</div></div>
     <div class="stat"><div>Max single profit</div><div class="n">{{ max_single_profit }}</div></div>
     <div class="stat"><div>Max one-leg loss</div><div class="n">{{ max_one_leg_loss }}</div></div>
   </div>
 
-  <h2>Scenario profits</h2>
+  <h2>Scenario notes</h2>
   <ul>
-    <li>Optimistic (theoretical): {{ optimistic_profit }}</li>
-    <li>Base (estimated/observed): {{ base_profit }}</li>
-    <li>Pessimistic (estimated/observed): {{ pessimistic_profit }}</li>
+    <li>Optimistic / Base / Pessimistic tick sums are <strong>not</strong> profit.</li>
+    <li>Paper realized P&amp;L (simulated): {{ base_profit }}</li>
+    <li>Qualified first-seen episodes: {{ pessimistic_profit }}</li>
   </ul>
 
   <h2>By fee status</h2>
@@ -133,7 +133,13 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
                 OpportunityRow.discovered_at <= end,
             )
         ).all()
-        from polymarket_scanner.database import ApiErrorRow, MarketRow, ScannerRunRow
+        from polymarket_scanner.database import (
+            ApiErrorRow,
+            MarketRow,
+            OpportunityEpisodeRow,
+            PaperAccountRow,
+            ScannerRunRow,
+        )
 
         markets_scanned = session.scalar(
             select(ScannerRunRow).where(ScannerRunRow.started_at >= start).limit(1)
@@ -144,6 +150,11 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         else:
             market_count = len(session.scalars(select(MarketRow)).all())
 
+        market_cat = {
+            r.market_id: r.category or "unknown"
+            for r in session.scalars(select(MarketRow)).all()
+        }
+
         api_errors = len(
             session.scalars(
                 select(ApiErrorRow).where(
@@ -153,25 +164,26 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         )
 
         raw_signals = len(ops)
-        net_signals = sum(1 for o in ops if o.net_profitable)
+        net_signals = sum(1 for o in ops if o.passes_rule_set and o.net_profitable)
+        qualified_ops = [o for o in ops if o.passes_rule_set]
         base_profitable = sum(
-            1 for o in ops if o.base_net and Decimal(o.base_net) > 0
+            1 for o in qualified_ops if o.base_net and Decimal(o.base_net) > 0
         )
         pessimistic_profitable = sum(
-            1 for o in ops if o.pessimistic_net and Decimal(o.pessimistic_net) > 0
+            1 for o in qualified_ops if o.pessimistic_net and Decimal(o.pessimistic_net) > 0
         )
 
-        def sum_col(attr: str) -> Decimal:
-            total = Decimal("0")
-            for o in ops:
-                v = getattr(o, attr)
-                if v:
-                    total += Decimal(v)
-            return total
+        paper = session.scalar(select(PaperAccountRow).limit(1))
+        paper_pnl = paper.realized_pnl if paper else "0"
+        ep_count = len(
+            session.scalars(
+                select(OpportunityEpisodeRow).where(
+                    OpportunityEpisodeRow.first_seen_at >= start,
+                    OpportunityEpisodeRow.first_seen_at <= end,
+                )
+            ).all()
+        )
 
-        opt_p = sum_col("optimistic_net")
-        base_p = sum_col("base_net")
-        pes_p = sum_col("pessimistic_net")
         max_single = max((Decimal(o.net_profit) for o in ops), default=Decimal("0"))
         max_one_leg = Decimal("0")
         for o in ops:
@@ -188,8 +200,8 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
                 by_fee["fees_off"] += 1
             else:
                 by_fee["unknown"] += 1
-            # category unknown on opportunity — bucket as unknown
-            by_category["unknown"] = by_category.get("unknown", 0) + 1
+            cat = market_cat.get(o.market_id) or "unknown"
+            by_category[cat] = by_category.get(cat, 0) + 1
 
         top20 = sorted(ops, key=lambda o: Decimal(o.net_profit), reverse=True)[:20]
         top_rows = [
@@ -216,12 +228,13 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             net_signals=net_signals,
             base_profitable=base_profitable,
             pessimistic_profitable=pessimistic_profitable,
-            total_sim_profit=format(base_p, "f"),
+            total_sim_profit=paper_pnl,
+            qualified_episodes=ep_count,
             max_single_profit=format(max_single, "f"),
             max_one_leg_loss=format(max_one_leg, "f"),
-            optimistic_profit=format(opt_p, "f"),
-            base_profit=format(base_p, "f"),
-            pessimistic_profit=format(pes_p, "f"),
+            optimistic_profit="n/a (do not sum ticks)",
+            base_profit=f"paper realized {paper_pnl}",
+            pessimistic_profit=f"qualified episodes {ep_count}",
             by_fee=by_fee,
             by_category=by_category,
             top20=top_rows,
@@ -283,7 +296,7 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             net_signals=net_signals,
             base_profitable=base_profitable,
             pessimistic_profitable=pessimistic_profitable,
-            total_sim_profit=format(base_p, "f"),
+            total_sim_profit=paper_pnl,
             max_single_profit=format(max_single, "f"),
             max_one_leg_loss=format(max_one_leg, "f"),
             html_path=str(html_path),

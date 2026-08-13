@@ -159,7 +159,8 @@ pytest -q
 - **HTTP 429**: exponential backoff via tenacity.
 - **Missing fees on Gamma**: enrich via CLOB `GET /clob-markets/{condition_id}` (fee curve in `fd`); legacy `/markets/{id}` lacks fee schedule details.
 - **Stale books**: opportunities tagged `stale data`; default rules exclude them.
-- **Geoblock**: shown for awareness only — no bypass/proxy support.
+- **Geoblock**: shown for awareness only. HTTP client honors `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`. SOCKS requires optional extra: `pip install 'httpx[socks]'` (see `pyproject.toml` optional `socks`).
+- **All P&L figures are simulated** and must not be treated as executable profit.
 
 ## API rate limits
 

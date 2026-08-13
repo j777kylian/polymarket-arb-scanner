@@ -7,7 +7,7 @@ from typing import Any
 
 from polymarket_scanner.config import AppConfig, get_config
 from polymarket_scanner.database import get_setting, session_scope, set_setting
-
+from polymarket_scanner.parse_bool import parse_strict_bool
 
 RUNTIME_KEYS = (
     "orderbook_poll_interval_seconds",
@@ -23,6 +23,13 @@ RUNTIME_KEYS = (
     "scanner_market_limit",
     "scanner_sync_markets",
 )
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    parsed = parse_strict_bool(value)
+    if parsed is None:
+        return default
+    return parsed
 
 
 def save_runtime_settings(values: dict[str, Any]) -> None:
@@ -65,13 +72,22 @@ def apply_runtime_to_config(cfg: AppConfig | None = None) -> AppConfig:
     if max_age := overrides.get("max_data_age_seconds"):
         data.setdefault("scanner", {})["max_data_age_seconds"] = int(max_age)
     if overrides.get("paper_enabled") is not None:
-        data.setdefault("paper", {})["enabled"] = bool(overrides["paper_enabled"])
+        data.setdefault("paper", {})["enabled"] = _as_bool(overrides["paper_enabled"])
     if delay := overrides.get("paper_delay_ms"):
         data.setdefault("paper", {})["delay_ms"] = int(delay)
     if tif := overrides.get("paper_time_in_force"):
         data.setdefault("paper", {})["time_in_force"] = str(tif)
     if min_profit := overrides.get("paper_min_net_profit"):
         data.setdefault("paper", {})["min_net_profit"] = Decimal(str(min_profit))
+    scanner = data.setdefault("scanner", {})
+    if "scanner_max_pages" in overrides:
+        val = overrides["scanner_max_pages"]
+        scanner["max_pages"] = int(val) if val not in (None, 0, "0") else None
+    if "scanner_market_limit" in overrides:
+        val = overrides["scanner_market_limit"]
+        scanner["market_limit"] = int(val) if val not in (None, 0, "0") else None
+    if "scanner_sync_markets" in overrides:
+        scanner["sync_markets"] = _as_bool(overrides["scanner_sync_markets"], default=True)
     return AppConfig.model_validate(data)
 
 

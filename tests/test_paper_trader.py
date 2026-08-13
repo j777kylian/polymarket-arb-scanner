@@ -85,6 +85,7 @@ def test_paper_merge_recycles_capital(tmp_path, monkeypatch) -> None:
         yes_token_id="y",
         no_token_id="n",
         fees_enabled=False,
+        minimum_order_size=Decimal("1"),
     )
     sig = OpportunitySignal(
         market_id="m1",
@@ -103,7 +104,7 @@ def test_paper_merge_recycles_capital(tmp_path, monkeypatch) -> None:
         levels_used_yes=1,
         levels_used_no=1,
     )
-    result = execute_paper_complete_set(market, sig, yes, no, tif="FOK", delay_ms=500)
+    result = execute_paper_complete_set(market, sig, yes, no, tif="FOK", delay_ms=500, skip_min_profit=True)
     assert result is not None
     assert result["status"] == "merged"
     cash, _occ, pnl = get_paper_account()
