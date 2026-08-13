@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 from jinja2 import Template
-from sqlalchemy import select
+from sqlalchemy import desc, select
 
 from polymarket_scanner.config import get_config
-from polymarket_scanner.database import DailyReportRow, OpportunityRow, session_scope, utcnow
+from polymarket_scanner.database import (
+    ApiErrorRow,
+    DailyReportRow,
+    MarketRow,
+    OpportunityEpisodeRow,
+    OpportunityRow,
+    PaperAccountRow,
+    PaperTradeRow,
+    ScannerRunRow,
+    session_scope,
+    utcnow,
+)
 from polymarket_scanner.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -54,7 +66,13 @@ HTML_TEMPLATE = Template(
     <div class="stat"><div>Net profitable</div><div class="n">{{ net_signals }}</div></div>
     <div class="stat"><div>Base profitable</div><div class="n">{{ base_profitable }}</div></div>
     <div class="stat"><div>Pessimistic profitable</div><div class="n">{{ pessimistic_profitable }}</div></div>
-    <div class="stat"><div>Paper realized P&amp;L (simulated)</div><div class="n">{{ total_sim_profit }}</div></div>
+    <div class="stat"><div>Daily realized P&amp;L (simulated)</div><div class="n">{{ daily_realized_pnl }}</div></div>
+    <div class="stat"><div>Cumulative realized P&amp;L (simulated)</div><div class="n">{{ cumulative_realized_pnl }}</div></div>
+    <div class="stat"><div>Available cash</div><div class="n">{{ available_cash }}</div></div>
+    <div class="stat"><div>Occupied inventory cost</div><div class="n">{{ occupied_inventory }}</div></div>
+    <div class="stat"><div>Marked inventory value</div><div class="n">{{ marked_inventory }}</div></div>
+    <div class="stat"><div>Account equity</div><div class="n">{{ account_equity }}</div></div>
+    <div class="stat"><div>Max drawdown</div><div class="n">{{ max_drawdown }}</div></div>
     <div class="stat"><div>Qualified episodes (first-seen)</div><div class="n">{{ qualified_episodes }}</div></div>
     <div class="stat"><div>Max single profit</div><div class="n">{{ max_single_profit }}</div></div>
     <div class="stat"><div>Max one-leg loss</div><div class="n">{{ max_one_leg_loss }}</div></div>
@@ -63,7 +81,9 @@ HTML_TEMPLATE = Template(
   <h2>Scenario notes</h2>
   <ul>
     <li>Optimistic / Base / Pessimistic tick sums are <strong>not</strong> profit.</li>
-    <li>Paper realized P&amp;L (simulated): {{ base_profit }}</li>
+    <li>Daily realized P&amp;L is the sum of PaperTradeRow.realized_pnl for this date (simulated).</li>
+    <li>Cumulative realized P&amp;L is the paper account ledger, not the daily sum.</li>
+    <li>Occupied inventory cost is not treated as realized loss.</li>
     <li>Qualified first-seen episodes: {{ pessimistic_profit }}</li>
   </ul>
 
@@ -133,22 +153,20 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
                 OpportunityRow.discovered_at <= end,
             )
         ).all()
-        from polymarket_scanner.database import (
-            ApiErrorRow,
-            MarketRow,
-            OpportunityEpisodeRow,
-            PaperAccountRow,
-            ScannerRunRow,
-        )
 
-        markets_scanned = session.scalar(
-            select(ScannerRunRow).where(ScannerRunRow.started_at >= start).limit(1)
-        )
-        market_count = 0
-        if markets_scanned:
-            market_count = markets_scanned.markets_synced
+        runs = session.scalars(
+            select(ScannerRunRow)
+            .where(ScannerRunRow.started_at >= start)
+            .order_by(desc(ScannerRunRow.started_at))
+        ).all()
+        live_run = next((r for r in runs if r.mode in {"live", "realtime"}), None)
+        latest = live_run or (runs[0] if runs else None)
+        if latest is not None and latest.mode in {"live", "realtime"} and latest.subscribed_markets:
+            market_count = latest.subscribed_markets
+        elif latest is not None:
+            market_count = latest.subscribed_markets or latest.markets_synced or 0
         else:
-            market_count = len(session.scalars(select(MarketRow)).all())
+            market_count = 0
 
         market_cat = {
             r.market_id: r.category or "unknown"
@@ -174,7 +192,23 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         )
 
         paper = session.scalar(select(PaperAccountRow).limit(1))
-        paper_pnl = paper.realized_pnl if paper else "0"
+        cumulative_pnl = paper.realized_pnl if paper else "0"
+        cash = paper.cash if paper else "0"
+        occupied = paper.occupied if paper else "0"
+        marked = (paper.marked_inventory if paper else None) or occupied
+        max_dd = paper.max_drawdown if paper else "0"
+        equity = format(Decimal(cash or "0") + Decimal(marked or "0"), "f")
+        day_trades = session.scalars(
+            select(PaperTradeRow).where(
+                PaperTradeRow.created_at >= start,
+                PaperTradeRow.created_at <= end,
+            )
+        ).all()
+        daily_pnl = sum(
+            (Decimal(t.realized_pnl or t.pnl or "0") for t in day_trades),
+            Decimal("0"),
+        )
+        paper_pnl = format(daily_pnl, "f")
         ep_count = len(
             session.scalars(
                 select(OpportunityEpisodeRow).where(
@@ -229,11 +263,18 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             base_profitable=base_profitable,
             pessimistic_profitable=pessimistic_profitable,
             total_sim_profit=paper_pnl,
+            daily_realized_pnl=paper_pnl,
+            cumulative_realized_pnl=cumulative_pnl,
+            available_cash=cash,
+            occupied_inventory=occupied,
+            marked_inventory=marked,
+            account_equity=equity,
+            max_drawdown=max_dd,
             qualified_episodes=ep_count,
             max_single_profit=format(max_single, "f"),
             max_one_leg_loss=format(max_one_leg, "f"),
             optimistic_profit="n/a (do not sum ticks)",
-            base_profit=f"paper realized {paper_pnl}",
+            base_profit=f"daily realized {paper_pnl}; cumulative {cumulative_pnl}",
             pessimistic_profit=f"qualified episodes {ep_count}",
             by_fee=by_fee,
             by_category=by_category,
@@ -301,6 +342,17 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             max_one_leg_loss=format(max_one_leg, "f"),
             html_path=str(html_path),
             csv_path=str(csv_path),
+            summary_json=json.dumps(
+                {
+                    "daily_realized_pnl": paper_pnl,
+                    "cumulative_realized_pnl": cumulative_pnl,
+                    "available_cash": cash,
+                    "occupied_inventory": occupied,
+                    "marked_inventory": marked,
+                    "account_equity": equity,
+                    "max_drawdown": max_dd,
+                }
+            ),
         )
         if existing:
             for k, v in fields.items():

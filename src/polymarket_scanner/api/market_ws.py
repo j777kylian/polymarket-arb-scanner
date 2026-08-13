@@ -11,7 +11,7 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from polymarket_scanner.config import get_config
+from polymarket_scanner.config import AppConfig, get_config
 from polymarket_scanner.logging_config import get_logger
 from polymarket_scanner.safety import assert_trading_disabled
 
@@ -24,12 +24,58 @@ def diff_tokens(old: set[str], new: set[str]) -> tuple[set[str], set[str]]:
     return new - old, old - new
 
 
+def initial_market_message(token_ids: list[str]) -> dict[str, Any]:
+    """First-connection subscribe (official market channel handshake)."""
+    return {
+        "assets_ids": list(token_ids),
+        "type": "market",
+        "initial_dump": True,
+        "custom_feature_enabled": True,
+    }
+
+
+def subscribe_operation_message(token_ids: list[str]) -> dict[str, Any]:
+    """Dynamic add after the socket is already subscribed."""
+    return {
+        "assets_ids": list(token_ids),
+        "operation": "subscribe",
+        "custom_feature_enabled": True,
+    }
+
+
+def unsubscribe_operation_message(token_ids: list[str]) -> dict[str, Any]:
+    """Dynamic remove. Must use operation=unsubscribe, not type=unsubscribe."""
+    return {
+        "assets_ids": list(token_ids),
+        "operation": "unsubscribe",
+    }
+
+
+def connection_subscribe_messages(
+    token_ids: list[str], *, chunk_size: int = 0
+) -> list[dict[str, Any]]:
+    """Prefer one initial type=market frame. Extra chunks use operation=subscribe."""
+    ids = list(token_ids)
+    if not ids:
+        return []
+    if chunk_size <= 0 or len(ids) <= chunk_size:
+        return [initial_market_message(ids)]
+    groups = _chunks(ids, chunk_size)
+    messages = [initial_market_message(groups[0])]
+    for group in groups[1:]:
+        messages.append(subscribe_operation_message(group))
+    return messages
+
+
 def subscribe_message(token_ids: list[str], *, initial_dump: bool = True) -> dict[str, Any]:
-    return {"assets_ids": token_ids, "type": "market", "initial_dump": initial_dump}
+    """Backward-compatible helper. Dynamic adds must use subscribe_operation_message."""
+    if initial_dump:
+        return initial_market_message(token_ids)
+    return subscribe_operation_message(token_ids)
 
 
 def unsubscribe_message(token_ids: list[str]) -> dict[str, Any]:
-    return {"assets_ids": token_ids, "type": "unsubscribe"}
+    return unsubscribe_operation_message(token_ids)
 
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:
@@ -63,9 +109,10 @@ class MarketWebsocketClient:
         *,
         on_connect: Callable[[int], Awaitable[None] | None] | None = None,
         on_disconnect: Callable[[], Awaitable[None] | None] | None = None,
+        config: AppConfig | None = None,
     ) -> None:
         assert_trading_disabled()
-        self.cfg = get_config()
+        self.cfg = config or get_config()
         self.on_message = on_message
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
@@ -93,13 +140,15 @@ class MarketWebsocketClient:
             self.request_rebuild()
             return added, removed
         try:
-            chunk = self.cfg.scanner.ws_subscribe_chunk
+            chunk = int(self.cfg.scanner.ws_subscribe_chunk or 0)
             if removed:
-                for group in _chunks(sorted(removed), chunk):
-                    await self._ws.send(json.dumps(unsubscribe_message(group)))
+                groups = _chunks(sorted(removed), chunk) if chunk > 0 else [sorted(removed)]
+                for group in groups:
+                    await self._ws.send(json.dumps(unsubscribe_operation_message(group)))
             if added:
-                for group in _chunks(sorted(added), chunk):
-                    await self._ws.send(json.dumps(subscribe_message(group, initial_dump=True)))
+                groups = _chunks(sorted(added), chunk) if chunk > 0 else [sorted(added)]
+                for group in groups:
+                    await self._ws.send(json.dumps(subscribe_operation_message(group)))
         except Exception:
             logger.warning("WS subscribe/unsubscribe send failed; rebuilding connection")
             self.request_rebuild()
@@ -128,7 +177,7 @@ class MarketWebsocketClient:
     async def _connect_once(self, token_ids: list[str]) -> None:
         url = self.cfg.api.market_ws_url
         ping_s = self.cfg.scanner.ws_ping_interval_seconds
-        chunk = self.cfg.scanner.ws_subscribe_chunk
+        chunk = int(self.cfg.scanner.ws_subscribe_chunk or 0)
         async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
             self._ws = ws
             self.connected = True
@@ -142,10 +191,8 @@ class MarketWebsocketClient:
                 result = self.on_connect(self.generation)
                 if asyncio.iscoroutine(result):
                     await result
-            for group in _chunks(token_ids, chunk) or [[]]:
-                if not group:
-                    continue
-                await ws.send(json.dumps(subscribe_message(group, initial_dump=True)))
+            for msg in connection_subscribe_messages(token_ids, chunk_size=chunk):
+                await ws.send(json.dumps(msg))
 
             async def heartbeat() -> None:
                 while not self._stop.is_set() and not self._rebuild.is_set():

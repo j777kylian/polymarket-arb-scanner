@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
+from decimal import Decimal
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -69,7 +69,7 @@ class ScannerService:
         init_db()
         started = utcnow()
         with session_scope() as session:
-            run = ScannerRunRow(started_at=started, status="running")
+            run = ScannerRunRow(started_at=started, status="running", mode="snapshot")
             session.add(run)
             session.flush()
             run_id = run.id
@@ -118,7 +118,10 @@ class ScannerService:
             if finished is not None:
                 finished.finished_at = utcnow()
                 finished.status = status
+                finished.mode = "snapshot"
                 finished.markets_synced = markets_synced
+                finished.discovered_markets = markets_synced
+                finished.subscribed_markets = markets_synced
                 finished.books_fetched = books_fetched
                 finished.signals_found = signals_found
                 finished.api_errors = api_errors
@@ -156,7 +159,16 @@ class ScannerService:
             self.cfg.scanner.market_limit = market_limit
         if sync_markets is not None:
             self.cfg.scanner.sync_markets = sync_markets
-        mode = (mode or self.cfg.scanner.mode or "static").lower()
+        from polymarket_scanner.config import normalize_scanner_mode
+
+        mode = normalize_scanner_mode(mode or self.cfg.scanner.mode or "live")
+        if mode == "snapshot":
+            logger.error(
+                "Snapshot Audit is --once only. Use --daemon for Live Research (WebSocket). "
+                "Static REST polling daemon has been removed."
+            )
+            return
+
         try:
             self._lock.acquire(timeout=0)
         except Timeout:
@@ -166,73 +178,47 @@ class ScannerService:
         self._running = True
         self._paused = False
         set_scanner_process_status(
-            mode=mode,
+            mode="live",
             paper=paper,
             pid=os.getpid(),
             started_at=utcnow().isoformat(),
         )
-        logger.info("Scanner daemon started mode=%s paper=%s (read-only)", mode, paper)
-        try:
-            if mode == "realtime":
-                from polymarket_scanner.realtime import RealtimeScanner
-                from polymarket_scanner.reporting.html_report import generate_daily_report
+        logger.info("Live Research started paper=%s (read-only)", paper)
+        from polymarket_scanner.realtime import RealtimeScanner
+        from polymarket_scanner.reporting.html_report import generate_daily_report
 
-                rt = RealtimeScanner(paper=paper)
-                last_report_date = ""
+        rt = RealtimeScanner(config=self.cfg, paper=paper)
+        # Do not emit an empty report at start — wait for the next UTC date rollover.
+        last_report_date = utcnow().date().isoformat()
 
-                async def report_loop() -> None:
-                    nonlocal last_report_date
-                    while self._running:
-                        if self.cfg.scanner.auto_daily_report:
-                            today = utcnow().date().isoformat()
-                            hour = utcnow().hour
-                            if today != last_report_date and hour >= self.cfg.reporting.report_hour_utc:
-                                try:
-                                    generate_daily_report(today)
-                                    last_report_date = today
-                                except Exception:
-                                    logger.exception("Auto daily report failed")
-                        await asyncio.sleep(60)
-
-                report_task = asyncio.create_task(report_loop())
-                try:
-                    await rt.run()
-                finally:
-                    report_task.cancel()
-                return
-
-            last_market_sync = 0.0
-            last_report_date = ""
+        async def report_loop() -> None:
+            nonlocal last_report_date
             while self._running:
-                if self._paused:
-                    await asyncio.sleep(1)
-                    continue
-                self._refresh_cfg()
-                now = time.time()
-                sync = self.cfg.scanner.sync_markets and (
-                    (now - last_market_sync) >= self.cfg.scanner.market_sync_interval_seconds
-                )
-                try:
-                    await self.run_once(
-                        sync_markets=sync,
-                        market_limit=self.cfg.scanner.market_limit,
-                        max_market_pages=self.cfg.scanner.max_pages,
-                    )
-                    if sync:
-                        last_market_sync = now
-                    if self.cfg.scanner.auto_daily_report:
-                        today = utcnow().date().isoformat()
-                        if today != last_report_date and utcnow().hour >= self.cfg.reporting.report_hour_utc:
-                            from polymarket_scanner.reporting.html_report import (
-                                generate_daily_report,
-                            )
-
+                if self.cfg.scanner.auto_daily_report:
+                    today = utcnow().date().isoformat()
+                    hour = utcnow().hour
+                    if today != last_report_date and hour >= self.cfg.reporting.report_hour_utc:
+                        try:
                             generate_daily_report(today)
                             last_report_date = today
-                except Exception as exc:
-                    logger.exception("Daemon iteration failed: %s", exc)
-                await asyncio.sleep(self.cfg.scanner.orderbook_poll_interval_seconds)
+                        except Exception:
+                            logger.exception("Auto daily report failed")
+                await asyncio.sleep(60)
+
+        report_task = asyncio.create_task(report_loop())
+        try:
+            await rt.run()
         finally:
+            report_task.cancel()
+            try:
+                await report_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            if self.cfg.scanner.auto_daily_report:
+                try:
+                    generate_daily_report()
+                except Exception:
+                    logger.exception("Stop-time daily report failed")
             self._running = False
             set_scanner_process_status(mode=None)
             try:
@@ -245,6 +231,9 @@ def get_dashboard_stats() -> dict[str, Any]:
     from polymarket_scanner.database import ApiErrorRow, MarketRow, OrderBookSnapshotRow
 
     with session_scope() as session:
+        last_run = session.scalar(
+            select(ScannerRunRow).order_by(desc(ScannerRunRow.started_at)).limit(1)
+        )
         markets = session.scalar(
             select(func.count()).select_from(MarketRow).where(
                 MarketRow.active.is_(True),
@@ -253,9 +242,11 @@ def get_dashboard_stats() -> dict[str, Any]:
                 MarketRow.enable_order_book.is_(True),
             )
         ) or 0
-        last_run = session.scalar(
-            select(ScannerRunRow).order_by(desc(ScannerRunRow.started_at)).limit(1)
-        )
+        if last_run is not None and last_run.mode in {"live", "realtime"}:
+            if last_run.subscribed_markets:
+                markets = last_run.subscribed_markets
+            elif last_run.markets_synced:
+                markets = last_run.markets_synced
         today = utcnow().date().isoformat()
         todays = session.scalar(
             select(func.count()).select_from(OpportunityRow).where(
@@ -319,6 +310,23 @@ def get_dashboard_stats() -> dict[str, Any]:
         paper = session.scalar(select(PaperAccountRow).limit(1))
         paper_trades = session.scalar(select(func.count()).select_from(PaperTradeRow)) or 0
         paper_realized = paper.realized_pnl if paper else None
+        day_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        daily_rows = session.scalars(
+            select(PaperTradeRow).where(PaperTradeRow.created_at >= day_start)
+        ).all()
+        daily_realized = sum(
+            (Decimal(t.realized_pnl or t.pnl or "0") for t in daily_rows),
+            Decimal("0"),
+        )
+        occupied = paper.occupied if paper else None
+        marked = (paper.marked_inventory if paper else None) or occupied
+        cash = paper.cash if paper else None
+        peak = paper.peak_equity if paper else None
+        max_dd = paper.max_drawdown if paper else None
+        equity = None
+        if cash is not None:
+            marked_d = Decimal(marked or occupied or "0")
+            equity = format(Decimal(cash) + marked_d, "f")
 
         return {
             "markets": markets,
@@ -342,9 +350,16 @@ def get_dashboard_stats() -> dict[str, Any]:
             "latency_p50_ms": p50,
             "latency_p95_ms": p95,
             "latency_sufficient": sufficient,
-            "paper_cash": paper.cash if paper else None,
+            "paper_cash": cash,
             "paper_pnl": paper_realized,
             "paper_realized_pnl": paper_realized,
+            "paper_daily_realized_pnl": format(daily_realized, "f"),
+            "paper_cumulative_realized_pnl": paper_realized,
+            "paper_occupied": occupied,
+            "paper_marked_inventory": marked,
+            "paper_equity": equity,
+            "paper_max_drawdown": max_dd,
+            "paper_peak_equity": peak,
             "paper_trades": paper_trades,
             "date": today,
         }

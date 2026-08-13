@@ -16,7 +16,7 @@ api:
   market_page_limit: 100
 
 scanner:
-  mode: "static"
+  mode: "live"
   market_sync_interval_seconds: 300
   orderbook_poll_interval_seconds: 45
   max_data_age_seconds: 60
@@ -25,22 +25,30 @@ scanner:
   lock_file: "data/scanner.lock"
   auto_daily_report: true
   ws_ping_interval_seconds: 10
-  ws_subscribe_chunk: 200
+  ws_subscribe_chunk: 0
   ws_recalc_debounce_ms: 75
   latency_sufficient_p50_ms: 200
   latency_sufficient_p95_ms: 500
   max_book_skew_ms: 250
   observed_delay_tolerance_ms: 250
   ws_persist_min_interval_ms: 400
+  min_walk_forward_trades: 30
 
 paper:
   enabled: false
   starting_capital: "1000"
   delay_ms: 500
+  signal_to_first_leg_ms: 500
+  inter_leg_delay_ms: 100
+  force_close_delay_ms: 200
   time_in_force: "FAK"
   first_leg: "YES"
   force_close_unhedged: true
   min_net_profit: "0.50"
+  min_profit_per_share: "0"
+  minimum_quantity: "0"
+  strategy_id: "live_default"
+  strategy_version: 1
 
 simulation:
   default_profile: "base"

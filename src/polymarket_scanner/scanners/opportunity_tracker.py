@@ -107,3 +107,11 @@ def close_episodes(
             row.duration_seconds = max(0.0, (now_u - first).total_seconds())
             closed += 1
     return closed
+
+
+def episode_is_open(episode_id: int | None) -> bool:
+    if episode_id is None:
+        return False
+    with session_scope() as session:
+        row = session.get(OpportunityEpisodeRow, episode_id)
+        return bool(row and row.is_open)

@@ -1,4 +1,4 @@
-"""Streamlit scanner control — phase 1/2/3 commands and live status."""
+"""Streamlit scanner control — Snapshot Audit and Live Research."""
 
 from __future__ import annotations
 
@@ -26,12 +26,12 @@ from polymarket_scanner.database import (
 from polymarket_scanner.runtime_settings import save_runtime_settings, set_scanner_process_status
 from polymarket_scanner.scheduler import ScannerService
 
-PhaseId = Literal["phase1", "phase2", "phase3"]
+ExecutionMode = Literal["observe", "paper"]
+ProductId = Literal["snapshot", "live"]
 
 
 @dataclass
-class PhaseParams:
-    poll_interval_s: int = 45
+class ScannerParams:
     market_sync_s: int = 300
     max_pages: int | None = None
     market_limit: int | None = None
@@ -40,50 +40,48 @@ class PhaseParams:
     paper_tif: str = "FAK"
     paper_min_net_profit: float = 0.50
     auto_daily_report: bool = True
+    poll_interval_s: int = 45  # unused for live; kept for settings compatibility
 
-    def to_runtime_settings(self, *, phase: PhaseId, daemon: bool) -> dict[str, Any]:
-        paper = phase == "phase3"
+    def to_runtime_settings(self, *, paper: bool) -> dict[str, Any]:
         return {
             "orderbook_poll_interval_seconds": self.poll_interval_s,
             "market_sync_interval_seconds": self.market_sync_s,
             "paper_delay_ms": self.paper_delay_ms,
             "paper_time_in_force": self.paper_tif,
             "paper_min_net_profit": self.paper_min_net_profit,
-            "paper_enabled": paper and daemon,
+            "paper_enabled": paper,
             "scanner_max_pages": self.max_pages,
             "scanner_market_limit": self.market_limit,
             "scanner_sync_markets": self.sync_markets,
         }
 
 
+# Backward-compatible alias used by older tests/imports.
+PhaseParams = ScannerParams
+
+
 @dataclass
 class ScannerStatus:
     running: bool = False
     source: str = "stopped"  # stopped | ui_subprocess | lock_file | db
-    mode: str | None = None  # static | realtime
-    phase: PhaseId | None = None
+    mode: str | None = None  # snapshot | live
+    product: str | None = None
+    execution: ExecutionMode | None = None
     paper: bool = False
     pid: int | None = None
     started_at: str | None = None
     lock_held: bool = False
     ui_proc_alive: bool = False
     message: str = ""
+    phase: str | None = None  # unused; kept so old UI bindings do not crash
 
 
-def _phase_label(phase: PhaseId) -> str:
-    return {
-        "phase1": "Phase 1 — Static REST scan",
-        "phase2": "Phase 2 — Realtime WebSocket",
-        "phase3": "Phase 3 — Realtime + Paper",
-    }[phase]
-
-
-def _phase_to_mode(phase: PhaseId) -> tuple[str, bool]:
-    if phase == "phase1":
-        return "static", False
-    if phase == "phase2":
-        return "realtime", False
-    return "realtime", True
+def _product_label(product: ProductId, execution: ExecutionMode = "observe") -> str:
+    if product == "snapshot":
+        return "Snapshot Audit"
+    if execution == "paper":
+        return "Live Research — Paper Trading"
+    return "Live Research — Observe Only"
 
 
 def is_lock_held() -> bool:
@@ -101,16 +99,17 @@ def is_lock_held() -> bool:
         return lock_path.exists()
 
 
-def build_daemon_cmd(phase: PhaseId, params: PhaseParams) -> list[str]:
-    mode, paper = _phase_to_mode(phase)
+def build_daemon_cmd(execution: ExecutionMode, params: ScannerParams) -> list[str]:
     cmd = [
         sys.executable,
         str(ROOT_DIR / "scripts" / "run_scanner.py"),
         "--daemon",
         "--mode",
-        mode,
+        "live",
+        "--execution",
+        execution,
     ]
-    if paper:
+    if execution == "paper":
         cmd.append("--paper")
     if params.max_pages is not None:
         cmd.extend(["--max-pages", str(params.max_pages)])
@@ -132,11 +131,17 @@ def get_scanner_status(ui_proc: subprocess.Popen | None = None) -> ScannerStatus
         pid = get_setting(session, "scanner_pid")
         started_at = get_setting(session, "scanner_started_at")
 
-    phase: PhaseId | None = None
-    if mode == "static":
-        phase = "phase1"
-    elif mode == "realtime":
-        phase = "phase2" if not paper else "phase3"
+    if mode in {"static", "snapshot"}:
+        mode = "snapshot"
+        product: str | None = "snapshot"
+        execution: ExecutionMode | None = "observe"
+    elif mode in {"realtime", "live"}:
+        mode = "live"
+        product = "live"
+        execution = "paper" if paper else "observe"
+    else:
+        product = None
+        execution = None
 
     running = ui_alive or lock_held
     source = "stopped"
@@ -153,19 +158,21 @@ def get_scanner_status(ui_proc: subprocess.Popen | None = None) -> ScannerStatus
     if ui_alive and ui_proc is not None:
         msg_parts.append(f"UI subprocess pid={ui_proc.pid}")
     if mode:
-        msg_parts.append(f"mode={mode} paper={paper}")
+        msg_parts.append(f"mode={mode} execution={execution} paper={paper}")
 
     return ScannerStatus(
         running=running,
         source=source,
         mode=mode,
-        phase=phase,
+        product=product,
+        execution=execution,
         paper=paper,
         pid=int(pid) if pid else (ui_proc.pid if ui_alive and ui_proc else None),
         started_at=str(started_at) if started_at else None,
         lock_held=lock_held,
         ui_proc_alive=ui_alive,
         message=" · ".join(msg_parts) if msg_parts else "Scanner stopped",
+        phase=product,
     )
 
 
@@ -182,7 +189,6 @@ def read_log_tail(lines: int = 40) -> str:
 
 
 def get_recent_live_data(*, limit: int = 12) -> dict[str, list[dict[str, Any]]]:
-    # Build plain dicts inside the session — expire_on_commit would detach ORM rows.
     with session_scope() as session:
         opps = [
             {
@@ -219,7 +225,8 @@ def get_recent_live_data(*, limit: int = 12) -> dict[str, list[dict[str, Any]]]:
                 "tif": t.tif,
                 "yes_qty": float(t.yes_qty or 0),
                 "no_qty": float(t.no_qty or 0),
-                "pnl": float(t.pnl or 0),
+                "pnl": float(t.realized_pnl or t.pnl or 0),
+                "reject_reason": t.reject_reason,
             }
             for t in session.scalars(
                 select(PaperTradeRow).order_by(desc(PaperTradeRow.created_at)).limit(limit)
@@ -230,7 +237,7 @@ def get_recent_live_data(*, limit: int = 12) -> dict[str, list[dict[str, Any]]]:
                 "started_at": ensure_utc(r.started_at),
                 "status": r.status,
                 "signals": r.signals_found,
-                "markets": r.markets_synced,
+                "markets": r.subscribed_markets or r.markets_synced,
             }
             for r in session.scalars(
                 select(ScannerRunRow).order_by(desc(ScannerRunRow.started_at)).limit(5)
@@ -245,8 +252,8 @@ def get_recent_live_data(*, limit: int = 12) -> dict[str, list[dict[str, Any]]]:
     }
 
 
-async def run_phase1_once(params: PhaseParams) -> dict[str, Any]:
-    save_runtime_settings(params.to_runtime_settings(phase="phase1", daemon=False))
+async def run_snapshot_once(params: ScannerParams) -> dict[str, Any]:
+    save_runtime_settings(params.to_runtime_settings(paper=False))
     return await ScannerService().run_once(
         max_market_pages=params.max_pages,
         market_limit=params.market_limit,
@@ -254,22 +261,35 @@ async def run_phase1_once(params: PhaseParams) -> dict[str, Any]:
     )
 
 
-def start_phase_daemon(phase: PhaseId, params: PhaseParams) -> tuple[subprocess.Popen | None, str]:
+run_phase1_once = run_snapshot_once
+
+
+def start_live_daemon(
+    execution: ExecutionMode, params: ScannerParams
+) -> tuple[subprocess.Popen | None, str]:
     status = get_scanner_status()
     if status.running:
         return None, f"Scanner already running ({status.message})"
 
-    save_runtime_settings(params.to_runtime_settings(phase=phase, daemon=True))
-    mode, paper = _phase_to_mode(phase)
-    cmd = build_daemon_cmd(phase, params)
+    paper = execution == "paper"
+    save_runtime_settings(params.to_runtime_settings(paper=paper))
+    cmd = build_daemon_cmd(execution, params)
     proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR))
     set_scanner_process_status(
-        mode=mode,
+        mode="live",
         paper=paper,
         pid=proc.pid,
         started_at=datetime.now(timezone.utc).isoformat(),
     )
-    return proc, f"Started {_phase_label(phase)} · pid={proc.pid}"
+    return proc, f"Started {_product_label('live', execution)} · pid={proc.pid}"
+
+
+def start_phase_daemon(phase: str, params: ScannerParams) -> tuple[subprocess.Popen | None, str]:
+    """Compatibility wrapper — Phase 1 daemon is removed; live maps to WebSocket."""
+    if phase in {"phase1", "snapshot", "static"}:
+        return None, "Snapshot Audit is --once only. Static REST polling daemon was removed."
+    execution: ExecutionMode = "paper" if phase in {"phase3", "paper"} else "observe"
+    return start_live_daemon(execution, params)
 
 
 def stop_scanner(
@@ -319,8 +339,8 @@ def stop_scanner(
     return None, " · ".join(messages)
 
 
-def load_params_from_settings(default: PhaseParams | None = None) -> PhaseParams:
-    base = default or PhaseParams()
+def load_params_from_settings(default: ScannerParams | None = None) -> ScannerParams:
+    base = default or ScannerParams()
     cfg = get_config()
     with session_scope() as session:
         poll = get_setting(session, "orderbook_poll_interval_seconds")
@@ -331,7 +351,7 @@ def load_params_from_settings(default: PhaseParams | None = None) -> PhaseParams
         max_p = get_setting(session, "scanner_max_pages")
         mlim = get_setting(session, "scanner_market_limit")
         sync_m = get_setting(session, "scanner_sync_markets")
-    return PhaseParams(
+    return ScannerParams(
         poll_interval_s=int(poll) if poll is not None else cfg.scanner.orderbook_poll_interval_seconds,
         market_sync_s=int(sync) if sync is not None else cfg.scanner.market_sync_interval_seconds,
         max_pages=int(max_p) if max_p is not None else base.max_pages,

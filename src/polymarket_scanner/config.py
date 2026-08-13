@@ -32,16 +32,16 @@ class ApiConfig(BaseModel):
 
 
 class ScannerConfig(BaseModel):
-    mode: str = "static"  # static | realtime
+    mode: str = "live"  # snapshot | live (realtime alias accepted)
     market_sync_interval_seconds: int = 300
-    orderbook_poll_interval_seconds: int = 45  # phase-1: 30–60s
+    orderbook_poll_interval_seconds: int = 45
     max_data_age_seconds: int = 60
     default_rule_set: str = "Balanced"
     retention_days: int = 14
     lock_file: str = "data/scanner.lock"
     auto_daily_report: bool = True
     ws_ping_interval_seconds: int = 10
-    ws_subscribe_chunk: int = 200
+    ws_subscribe_chunk: int = 0  # 0 = send all tokens in one initial type=market frame
     ws_recalc_debounce_ms: int = 75
     latency_sufficient_p50_ms: float = 200.0
     latency_sufficient_p95_ms: float = 500.0
@@ -51,16 +51,28 @@ class ScannerConfig(BaseModel):
     market_limit: int | None = None
     sync_markets: bool = True
     ws_persist_min_interval_ms: int = 400
+    min_walk_forward_trades: int = 30
 
 
 class PaperConfig(BaseModel):
     enabled: bool = False
     starting_capital: Decimal = Decimal("1000")
-    delay_ms: int = 500
+    delay_ms: int = 500  # alias of signal_to_first_leg_ms
+    signal_to_first_leg_ms: int = 500
+    inter_leg_delay_ms: int = 100
+    force_close_delay_ms: int = 200
     time_in_force: str = "FAK"  # FOK | FAK
     first_leg: str = "YES"
     force_close_unhedged: bool = True
     min_net_profit: Decimal = Decimal("0.50")
+    min_profit_per_share: Decimal = Decimal("0")
+    minimum_quantity: Decimal = Decimal("0")
+    strategy_id: str = "live_default"
+    strategy_version: int = 1
+
+    @property
+    def first_leg_delay_ms(self) -> int:
+        return int(self.signal_to_first_leg_ms or self.delay_ms)
 
 
 class ScenarioProfileConfig(BaseModel):
@@ -165,3 +177,13 @@ def get_config(config_path: str | None = None) -> AppConfig:
 def reload_config(config_path: str | None = None) -> AppConfig:
     get_config.cache_clear()
     return get_config(config_path)
+
+
+def normalize_scanner_mode(mode: str | None) -> str:
+    """Map CLI aliases to snapshot | live. Static daemon polling is not a product mode."""
+    value = (mode or "live").strip().lower()
+    if value in {"static", "snapshot", "once", "audit"}:
+        return "snapshot"
+    if value in {"realtime", "live", "daemon", "research"}:
+        return "live"
+    return value

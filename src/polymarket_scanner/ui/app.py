@@ -47,14 +47,14 @@ from polymarket_scanner.scheduler import get_dashboard_stats
 from polymarket_scanner.simulation.execution_simulator import simulate_forward
 from polymarket_scanner.simulation.scenario_profiles import ScenarioProfile
 from polymarket_scanner.ui.scanner_control import (
-    PhaseParams,
+    ScannerParams,
     build_daemon_cmd,
     get_recent_live_data,
     get_scanner_status,
     load_params_from_settings,
     read_log_tail,
-    run_phase1_once,
-    start_phase_daemon,
+    run_snapshot_once,
+    start_live_daemon,
     stop_scanner,
 )
 
@@ -95,8 +95,10 @@ if "scanner_proc" not in st.session_state:
     st.session_state.scanner_proc = None
 if "live_refresh" not in st.session_state:
     st.session_state.live_refresh = False
+if "scanner_params" not in st.session_state:
+    st.session_state.scanner_params = load_params_from_settings()
 if "phase_params" not in st.session_state:
-    st.session_state.phase_params = load_params_from_settings()
+    st.session_state.phase_params = st.session_state.scanner_params
 
 _scan_status = get_scanner_status(st.session_state.scanner_proc)
 if _scan_status.running and not st.session_state.live_refresh:
@@ -105,7 +107,7 @@ if _scan_status.running and not st.session_state.live_refresh:
 st.sidebar.markdown("### Scanner status")
 if _scan_status.running:
     st.sidebar.success(
-        f"Running · {_scan_status.phase or _scan_status.mode} · pid={_scan_status.pid or '?'}"
+        f"Running · {_scan_status.product or _scan_status.mode} · pid={_scan_status.pid or '?'}"
     )
 else:
     st.sidebar.info("Stopped")
@@ -134,6 +136,15 @@ def _render_metrics(stats: dict) -> None:
         "Active = currently open episodes, not historical OpportunityRow rows. "
         "Do not treat summed per-tick base_net as profit. Paper P&L is simulated only."
     )
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Daily realized P&L", str(stats.get("paper_daily_realized_pnl") or "0"))
+    p2.metric("Cumulative realized P&L", str(stats.get("paper_cumulative_realized_pnl") or stats.get("paper_realized_pnl") or "0"))
+    p3.metric("Available cash", str(stats.get("paper_cash") or "n/a"))
+    p4.metric("Account equity", str(stats.get("paper_equity") or "n/a"))
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Occupied inventory cost", str(stats.get("paper_occupied") or "0"))
+    q2.metric("Marked inventory value", str(stats.get("paper_marked_inventory") or "0"))
+    q3.metric("Max drawdown", str(stats.get("paper_max_drawdown") or "0"))
 
     l1, l2, l3, l4 = st.columns(4)
     l1.metric("Open episodes", stats.get("open_episodes") or 0)
@@ -158,13 +169,10 @@ def _render_metrics(stats: dict) -> None:
     st.write(f"**Last orderbook update:** {stats['last_book_at']}")
 
 
-def _render_phase_params_form(key_prefix: str) -> PhaseParams:
-    p = st.session_state.phase_params
+def _render_phase_params_form(key_prefix: str) -> ScannerParams:
+    p = st.session_state.scanner_params
     with st.expander("Scan parameters", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        poll = c1.number_input(
-            "Poll interval (s)", min_value=15, max_value=120, value=p.poll_interval_s, key=f"{key_prefix}_poll"
-        )
+        c2, c3 = st.columns(2)
         sync = c2.number_input(
             "Market sync interval (s)", min_value=60, value=p.market_sync_s, key=f"{key_prefix}_sync"
         )
@@ -184,14 +192,13 @@ def _render_phase_params_form(key_prefix: str) -> PhaseParams:
         )
         c6, c7, c8 = st.columns(3)
         delay = c6.number_input(
-            "Paper delay (ms)", min_value=0, value=p.paper_delay_ms, key=f"{key_prefix}_delay"
+            "Signal to first-leg delay (ms)", min_value=0, value=p.paper_delay_ms, key=f"{key_prefix}_delay"
         )
         tif = c7.selectbox("Paper TIF", ["FAK", "FOK"], index=0 if p.paper_tif == "FAK" else 1, key=f"{key_prefix}_tif")
         min_p = c8.number_input(
             "Min net profit ($)", min_value=0.0, value=float(p.paper_min_net_profit), key=f"{key_prefix}_minp"
         )
-    return PhaseParams(
-        poll_interval_s=int(poll),
+    return ScannerParams(
         market_sync_s=int(sync),
         max_pages=int(max_pages) if max_pages > 0 else None,
         market_limit=int(mlimit) if mlimit > 0 else None,
@@ -203,10 +210,11 @@ def _render_phase_params_form(key_prefix: str) -> PhaseParams:
 
 
 def _render_scanner_control() -> None:
-    st.subheader("Scanner control — Phase 1 / 2 / 3")
+    st.subheader("Scanner control — Snapshot Audit / Live Research")
     st.caption(
-        "Phase 1 runs in-process (immediate UI feedback). "
-        "Phase 2/3 spawn a background daemon (WebSocket); enable **Live refresh** to stream DB updates."
+        "Snapshot Audit runs a single REST scan in-process. "
+        "Live Research spawns a WebSocket daemon; enable **Live refresh** to stream DB updates. "
+        "Paper Trading reuses the realtime scanner. No wallets, no POST /order."
     )
     status = get_scanner_status(st.session_state.scanner_proc)
     if status.running:
@@ -214,62 +222,54 @@ def _render_scanner_control() -> None:
     else:
         st.warning("No scanner daemon running")
 
-    tab1, tab2, tab3, tab_stop = st.tabs(
-        ["Phase 1 — Static", "Phase 2 — Realtime WS", "Phase 3 — Paper", "Stop / Report"]
+    tab1, tab2, tab_stop = st.tabs(
+        ["Snapshot Audit", "Live Research", "Stop / Report"]
     )
 
     with tab1:
-        st.markdown("REST poll Gamma + CLOB, ~30–60s cycle. Good for baseline scans without WebSocket.")
+        st.markdown(
+            "One REST scan of Gamma + CLOB. Use this for API, fee, book, and formula diagnostics. "
+            "There is no static polling daemon."
+        )
         params = _render_phase_params_form("p1")
-        b1, b2 = st.columns(2)
-        if b1.button("Run Phase 1 once (in-process)", type="primary", key="p1_once"):
-            with st.spinner("Running static scan…"):
-                summary = _run_async(run_phase1_once(params))
+        if st.button("Run Snapshot Audit once (in-process)", type="primary", key="p1_once"):
+            with st.spinner("Running snapshot scan…"):
+                summary = _run_async(run_snapshot_once(params))
+            st.session_state.scanner_params = params
             st.session_state.phase_params = params
             st.success(summary)
             st.session_state.live_refresh = True
             st.rerun()
-        if b2.button("Start Phase 1 daemon", key="p1_daemon"):
-            proc, msg = start_phase_daemon("phase1", params)
-            if proc:
-                st.session_state.scanner_proc = proc
-                st.session_state.phase_params = params
-                st.session_state.live_refresh = True
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-        st.code(" ".join(build_daemon_cmd("phase1", params)), language="bash")
+        st.code(
+            "python scripts/run_scanner.py --once --max-pages "
+            f"{params.max_pages or 1} --market-limit {params.market_limit or 50}",
+            language="bash",
+        )
 
     with tab2:
-        st.markdown("Public market WebSocket, incremental recalc, episode tracking, latency samples.")
+        st.markdown(
+            "Public market WebSocket, incremental recalc, episode tracking, latency samples. "
+            "Execution Mode is Observe Only or Paper Trading (simulated)."
+        )
         params = _render_phase_params_form("p2")
-        if st.button("Start Phase 2 daemon", type="primary", key="p2_daemon"):
-            proc, msg = start_phase_daemon("phase2", params)
+        execution = st.selectbox(
+            "Execution Mode",
+            ["observe", "paper"],
+            format_func=lambda x: "Observe Only" if x == "observe" else "Paper Trading",
+            key="live_execution",
+        )
+        if st.button("Start Live Research daemon", type="primary", key="live_daemon"):
+            proc, msg = start_live_daemon(execution, params)
             if proc:
                 st.session_state.scanner_proc = proc
+                st.session_state.scanner_params = params
                 st.session_state.phase_params = params
                 st.session_state.live_refresh = True
                 st.success(msg)
                 st.rerun()
             else:
                 st.error(msg)
-        st.code(" ".join(build_daemon_cmd("phase2", params)), language="bash")
-
-    with tab3:
-        st.markdown("Phase 2 + simulated paper trading (500ms delay, FOK/FAK, merge, no real orders).")
-        params = _render_phase_params_form("p3")
-        if st.button("Start Phase 3 daemon (realtime + paper)", type="primary", key="p3_daemon"):
-            proc, msg = start_phase_daemon("phase3", params)
-            if proc:
-                st.session_state.scanner_proc = proc
-                st.session_state.phase_params = params
-                st.session_state.live_refresh = True
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-        st.code(" ".join(build_daemon_cmd("phase3", params)), language="bash")
+        st.code(" ".join(build_daemon_cmd(execution, params)), language="bash")
 
     with tab_stop:
         c1, c2 = st.columns(2)

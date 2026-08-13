@@ -197,3 +197,26 @@ class LiveBookCache:
         st.last_update_at = now
         st.ready = True
         return updated
+
+    def apply_tick_size_change(
+        self, token_id: str, tick_size: Decimal, *, fetched_at: datetime | None = None
+    ) -> OrderBookSnapshot | None:
+        st = self._states.get(token_id)
+        if st is None or st.snapshot is None or not st.initialized_from_full_snapshot:
+            return None
+        if st.connection_generation != self.generation:
+            return None
+        now = fetched_at or datetime.now(timezone.utc)
+        book = st.snapshot.model_copy(update={"tick_size": tick_size, "fetched_at": now})
+        st.snapshot = book
+        st.last_update_at = now
+        return book
+
+    def ready_pair_count(self, markets: dict[str, Any]) -> int:
+        n = 0
+        for m in markets.values():
+            yes = getattr(m, "yes_token_id", None)
+            no = getattr(m, "no_token_id", None)
+            if yes and no and self.pair_ready(yes, no):
+                n += 1
+        return n

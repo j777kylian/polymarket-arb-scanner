@@ -75,6 +75,7 @@ def apply_runtime_to_config(cfg: AppConfig | None = None) -> AppConfig:
         data.setdefault("paper", {})["enabled"] = _as_bool(overrides["paper_enabled"])
     if delay := overrides.get("paper_delay_ms"):
         data.setdefault("paper", {})["delay_ms"] = int(delay)
+        data.setdefault("paper", {})["signal_to_first_leg_ms"] = int(delay)
     if tif := overrides.get("paper_time_in_force"):
         data.setdefault("paper", {})["time_in_force"] = str(tif)
     if min_profit := overrides.get("paper_min_net_profit"):

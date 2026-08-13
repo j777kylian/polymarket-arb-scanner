@@ -67,15 +67,12 @@ streamlit run src/polymarket_scanner/ui/app.py
 Scanner once / daemon:
 
 ```bash
-Scanner once / daemon:
-
-```bash
-# Phase 1 — static poll every ~45s, auto daily HTML/CSV
+# Snapshot Audit — single REST scan (API / fee / book / formula diagnostics)
 python scripts/run_scanner.py --once --max-pages 2 --market-limit 50
-python scripts/run_scanner.py --daemon --mode static
 
-# Phase 2+3 — public WebSocket + optional paper trading (still no real orders)
-python scripts/run_scanner.py --daemon --mode realtime --paper
+# Live Research — public WebSocket. Execution Mode: Observe Only (default) or Paper Trading
+python scripts/run_scanner.py --daemon --mode live
+python scripts/run_scanner.py --daemon --mode live --paper --max-pages 1 --market-limit 50
 ```
 
 Daily report:
@@ -94,6 +91,7 @@ docker compose up -d
 - Volumes: `data/`, `reports/`, `logs/`
 - Runs as non-root uid 10001
 - No trading credentials
+- Default `scanner` service is Live Research (Observe Only). Paper profile: `docker compose --profile paper up`
 
 ## UI pages
 
@@ -115,9 +113,10 @@ See `config/default.yaml` and `.env.example`.
 Important knobs:
 
 - `scanner.market_sync_interval_seconds`
-- `scanner.orderbook_poll_interval_seconds`
 - `scanner.max_data_age_seconds`
+- `scanner.max_pages` / `scanner.market_limit` (Live Research subscription cap)
 - `api.max_concurrent_requests`
+- `paper.signal_to_first_leg_ms` / `paper.inter_leg_delay_ms`
 - `simulation.profiles.*`
 
 ## Rules editor
@@ -143,7 +142,7 @@ Operators: `>`, `>=`, `<`, `<=`, `==`, `!=`, `contains`, `not contains`, `in`, `
 
 ## Database
 
-SQLite schema includes: markets, tokens, orderbook_snapshots/levels, fee_schedules, opportunities, simulation_runs/legs, rule_sets/rules, scanner_runs, api_errors, daily_reports, app_settings.
+SQLite schema includes: markets, tokens, orderbook_snapshots/levels, fee_schedules, opportunities, simulation_runs/legs, rule_sets/rules, scanner_runs, api_errors, daily_reports, app_settings, paper_account/trades, strategy_configs/runs/accounts/trades/evals.
 
 Init: `init_db()` on startup (creates tables + default rule sets).
 
@@ -168,26 +167,28 @@ Keep `max_concurrent_requests` modest (default 8). Daemon polls books on an inte
 
 ## Streamlit dashboard control
 
-The Dashboard wraps all three phases with parameters and live updates:
+The Dashboard wraps Snapshot Audit and Live Research with parameters and live updates:
 
 | Action | Behavior |
 |--------|----------|
-| **Phase 1 once** | Runs in-process; results appear immediately in metrics + SQLite |
-| **Phase 1/2/3 daemon** | Spawns `scripts/run_scanner.py`; parameters saved to `app_settings` |
+| **Snapshot Audit once** | Runs in-process REST scan; results appear immediately in metrics + SQLite |
+| **Live Research daemon** | Spawns `scripts/run_scanner.py --daemon --mode live`; Execution Mode is Observe Only or Paper Trading |
 | **Live refresh (5s)** | Auto-refreshes metrics, recent signals, episodes, paper trades |
-| **Stop** | Terminates subprocess / lock; optional daily report |
+| **Stop** | Terminates subprocess / lock; optional daily report (re-queries the database) |
 
-Sidebar shows scanner pid, mode, and lock status. Phase 2/3 cannot run fully in-process (WebSocket blocks Streamlit); use daemon + live refresh instead.
+Sidebar shows scanner pid, mode, and lock status. Live Research cannot run fully in-process (WebSocket blocks Streamlit); use daemon + live refresh instead.
 
-## Three operating phases
+## Operating modes
 
-**Phase 1 — static scan (no keys):** daemon polls Gamma + CLOB every 30–60s (`orderbook_poll_interval_seconds: 45`), writes SQLite, and auto-generates HTML/CSV daily reports.
+**Snapshot Audit — REST once (no keys):** `--once` fetches Gamma + CLOB books a single time. Keep this for diagnosing APIs, fees, order books, and the arb formula. There is **no** static REST polling daemon.
 
-**Phase 2 — realtime:** `--mode realtime` subscribes to the public market WebSocket (`wss://ws-subscriptions-clob.polymarket.com/ws/market`), applies `book` / `price_change` to an in-memory cache, recalculates **only dirty markets**, records episode first-seen/disappear times, and stores WS latency samples. Dashboard flags whether p50/p95 are sufficient vs a 500ms paper delay.
+**Live Research — realtime WebSocket:** `--daemon --mode live` subscribes to the public market channel (`wss://ws-subscriptions-clob.polymarket.com/ws/market`). First connection sends `type=market` with `initial_dump` and `custom_feature_enabled`. Dynamic adds use `operation=subscribe`; removes use `operation=unsubscribe` (not `type=unsubscribe`). Recalc is **dirty-market only**. Execution Mode is **Observe Only** or **Paper Trading**.
 
-**Phase 3 — paper trading (still not live):** `--paper` waits 500ms after a new episode, then simulates FOK/FAK taker fills, one-leg residual, YES+NO merge at $1, and cash recycle. No wallet, no CLOB credentials, no `POST /order`.
+**Paper Trading (still not live):** `--paper` reuses the same realtime scanner and live book cache. After a new episode it waits `signal_to_first_leg_ms`, recaptures books, simulates the first leg, waits `inter_leg_delay_ms`, recaptures a **new** second-leg book, and optionally force-closes leftover inventory from a third snapshot. Residual inventory is occupied capital, not realized P&L. No wallet, no CLOB credentials, no `POST /order`.
 
-Do not run both `scanner` and `scanner-realtime` compose services against one SQLite file at the same time (file lock). Pick one.
+Do not run both `scanner` and `scanner-paper` compose services against one SQLite file at the same time (file lock). Pick one.
+
+`--mode static` / `--mode realtime` remain as aliases for snapshot / live. `--daemon --mode static` is rejected.
 
 ## Completely read-only
 

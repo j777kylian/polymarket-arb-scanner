@@ -36,7 +36,7 @@ def test_close_episodes_reason(tmp_path, monkeypatch) -> None:
         levels_used_no=1,
     )
     sync_episodes([sig], scanned_market_ids={"m1"}, now=now)
-    n = close_episodes(market_ids={"m1"}, reason="market_removed")
+    n = close_episodes(market_ids={"m1"}, reason="market_resolved")
     assert n == 1
     stats = get_dashboard_stats()
     assert stats["active_opportunities"] == 0

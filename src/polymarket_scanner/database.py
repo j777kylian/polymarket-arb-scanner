@@ -308,6 +308,12 @@ class ScannerRunRow(Base):
     signals_found: Mapped[int] = mapped_column(Integer, default=0)
     api_errors: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discovered_markets: Mapped[int] = mapped_column(Integer, default=0)
+    subscribed_markets: Mapped[int] = mapped_column(Integer, default=0)
+    subscribed_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    ready_market_pairs: Mapped[int] = mapped_column(Integer, default=0)
+    fee_schedule_coverage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class ApiErrorRow(Base):
@@ -397,6 +403,9 @@ class PaperAccountRow(Base):
     cash: Mapped[str] = mapped_column(String(32), default="1000")
     occupied: Mapped[str] = mapped_column(String(32), default="0")
     realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    peak_equity: Mapped[str] = mapped_column(String(32), default="1000")
+    max_drawdown: Mapped[str] = mapped_column(String(32), default="0")
+    marked_inventory: Mapped[str] = mapped_column(String(32), default="0")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -424,9 +433,105 @@ class PaperTradeRow(Base):
     buy_fees: Mapped[str] = mapped_column(String(32), default="0")
     sell_fees: Mapped[str] = mapped_column(String(32), default="0")
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reject_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    signal_opportunity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    signal_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    target_execution_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    actual_execution_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_leg_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    second_leg_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    t0_book_hashes: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    execution_book_hashes: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    book_skew_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_net_profit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
 
 
-_engine = None
+class StrategyConfigRow(Base):
+    __tablename__ = "strategy_configs"
+    __table_args__ = (UniqueConstraint("strategy_id", "version", name="uq_strategy_id_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    name: Mapped[str] = mapped_column(String(128))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_live: Mapped[bool] = mapped_column(Boolean, default=False)
+    params_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StrategyRunRow(Base):
+    __tablename__ = "strategy_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[int] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class StrategyAccountRow(Base):
+    __tablename__ = "strategy_accounts"
+    __table_args__ = (UniqueConstraint("strategy_id", "version", name="uq_strategy_account"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    cash: Mapped[str] = mapped_column(String(32), default="1000")
+    occupied: Mapped[str] = mapped_column(String(32), default="0")
+    realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    peak_equity: Mapped[str] = mapped_column(String(32), default="1000")
+    max_drawdown: Mapped[str] = mapped_column(String(32), default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StrategyTradeRow(Base):
+    __tablename__ = "strategy_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[int] = mapped_column(Integer)
+    market_id: Mapped[str] = mapped_column(String(64), index=True)
+    episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(32))
+    reject_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    inventory_cost: Mapped[str] = mapped_column(String(32), default="0")
+    cash_after: Mapped[str] = mapped_column(String(32), default="0")
+    remaining_inventory: Mapped[str] = mapped_column(String(32), default="0")
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class StrategyEvalRow(Base):
+    __tablename__ = "strategy_evals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    training_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    training_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    validation_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    validation_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    insufficient_sample: Mapped[bool] = mapped_column(Boolean, default=False)
+    recommended_strategy_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recommended_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+_engine: Any = None
 _SessionLocal: sessionmaker[Session] | None = None
 
 
@@ -541,6 +646,30 @@ def _ensure_schema(engine) -> None:
         ("simulation_runs", "remaining_inventory", "VARCHAR(32) DEFAULT '0'"),
         ("simulation_runs", "realized_pnl", "VARCHAR(32) DEFAULT '0'"),
         ("simulation_runs", "unrealized_inventory_cost", "VARCHAR(32) DEFAULT '0'"),
+        ("scanner_runs", "discovered_markets", "INTEGER DEFAULT 0"),
+        ("scanner_runs", "subscribed_markets", "INTEGER DEFAULT 0"),
+        ("scanner_runs", "subscribed_tokens", "INTEGER DEFAULT 0"),
+        ("scanner_runs", "ready_market_pairs", "INTEGER DEFAULT 0"),
+        ("scanner_runs", "fee_schedule_coverage", "VARCHAR(32)"),
+        ("scanner_runs", "mode", "VARCHAR(32)"),
+        ("paper_account", "peak_equity", "VARCHAR(32) DEFAULT '1000'"),
+        ("paper_account", "max_drawdown", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_account", "marked_inventory", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "reject_reason", "VARCHAR(64)"),
+        ("paper_trades", "strategy_id", "VARCHAR(64)"),
+        ("paper_trades", "strategy_version", "INTEGER"),
+        ("paper_trades", "signal_opportunity_id", "INTEGER"),
+        ("paper_trades", "signal_time", "DATETIME"),
+        ("paper_trades", "target_execution_time", "DATETIME"),
+        ("paper_trades", "actual_execution_time", "DATETIME"),
+        ("paper_trades", "first_leg_time", "DATETIME"),
+        ("paper_trades", "second_leg_time", "DATETIME"),
+        ("paper_trades", "close_time", "DATETIME"),
+        ("paper_trades", "t0_book_hashes", "VARCHAR(256)"),
+        ("paper_trades", "execution_book_hashes", "VARCHAR(256)"),
+        ("paper_trades", "book_skew_ms", "FLOAT"),
+        ("paper_trades", "expected_net_profit", "VARCHAR(32)"),
+        ("paper_trades", "realized_pnl", "VARCHAR(32) DEFAULT '0'"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in specs:
@@ -600,7 +729,103 @@ def init_db(url: str | None = None) -> None:
                     realized_pnl="0",
                 )
             )
+        _seed_default_strategies(session)
     logger.info("Database initialized")
+
+
+def _seed_default_strategies(session: Session) -> None:
+    paper = get_config().paper
+    sim = get_config().simulation
+    scanner = get_config().scanner
+    seeds = [
+        {
+            "strategy_id": "live_default",
+            "name": "Live default",
+            "is_live": True,
+            "params": {
+                "delay_ms": paper.first_leg_delay_ms,
+                "inter_leg_delay_ms": paper.inter_leg_delay_ms,
+                "tif": paper.time_in_force,
+                "first_leg": paper.first_leg,
+                "min_net_profit": str(paper.min_net_profit),
+                "min_profit_per_share": str(paper.min_profit_per_share),
+                "minimum_quantity": str(paper.minimum_quantity),
+                "max_book_skew_ms": scanner.max_book_skew_ms,
+                "safety_buffer": str(sim.safety_buffer),
+                "force_close": paper.force_close_unhedged,
+                "force_close_delay_ms": paper.force_close_delay_ms,
+                "starting_capital": str(paper.starting_capital),
+            },
+        },
+        {
+            "strategy_id": "shadow_conservative",
+            "name": "Shadow conservative",
+            "is_live": False,
+            "params": {
+                "delay_ms": 750,
+                "inter_leg_delay_ms": 150,
+                "tif": "FOK",
+                "first_leg": "YES",
+                "min_net_profit": "1.00",
+                "min_profit_per_share": "0.005",
+                "minimum_quantity": "10",
+                "max_book_skew_ms": 150.0,
+                "safety_buffer": "0.02",
+                "force_close": True,
+                "force_close_delay_ms": 200,
+                "starting_capital": str(paper.starting_capital),
+            },
+        },
+        {
+            "strategy_id": "shadow_fast",
+            "name": "Shadow fast FAK",
+            "is_live": False,
+            "params": {
+                "delay_ms": 250,
+                "inter_leg_delay_ms": 50,
+                "tif": "FAK",
+                "first_leg": "YES",
+                "min_net_profit": "0.25",
+                "min_profit_per_share": "0",
+                "minimum_quantity": "0",
+                "max_book_skew_ms": 250.0,
+                "safety_buffer": "0.01",
+                "force_close": True,
+                "force_close_delay_ms": 100,
+                "starting_capital": str(paper.starting_capital),
+            },
+        },
+    ]
+    for seed in seeds:
+        found = session.scalar(
+            select(StrategyConfigRow).where(
+                StrategyConfigRow.strategy_id == seed["strategy_id"],
+                StrategyConfigRow.version == 1,
+            )
+        )
+        if found is not None:
+            continue
+        session.add(
+            StrategyConfigRow(
+                strategy_id=str(seed["strategy_id"]),
+                version=1,
+                name=str(seed["name"]),
+                enabled=True,
+                is_live=bool(seed["is_live"]),
+                params_json=json.dumps(seed["params"]),
+            )
+        )
+        session.add(
+            StrategyAccountRow(
+                strategy_id=str(seed["strategy_id"]),
+                version=1,
+                cash=str(paper.starting_capital),
+                occupied="0",
+                realized_pnl="0",
+                peak_equity=str(paper.starting_capital),
+                max_drawdown="0",
+            )
+        )
 
 
 def record_api_error(
