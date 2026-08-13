@@ -45,6 +45,7 @@ paper:
   time_in_force: "FAK"
   first_leg: "YES"
   force_close_unhedged: true
+  residual_close_retries: 3
   min_net_profit: "0.50"
   min_profit_per_share: "0"
   minimum_quantity: "0"

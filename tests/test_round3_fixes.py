@@ -453,17 +453,18 @@ def test_previous_day_daily_report(tmp_path, monkeypatch) -> None:
     get_config().reporting.reports_dir = str(tmp_path / "reports")
     prev = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
     with session_scope() as session:
-        session.add(
-            PaperTradeRow(
-                created_at=prev,
-                market_id="m1",
-                tif="FAK",
-                delay_ms=500,
-                status="merged",
-                realized_pnl="3.5",
-                pnl="3.5",
+            session.add(
+                PaperTradeRow(
+                    created_at=prev,
+                    realized_at=prev,
+                    market_id="m1",
+                    tif="FAK",
+                    delay_ms=500,
+                    status="merged",
+                    realized_pnl="3.5",
+                    pnl="3.5",
+                )
             )
-        )
     out = generate_daily_report("2026-08-12")
     assert out["report_date"] == "2026-08-12"
     assert Decimal(str(out["daily_realized_pnl"])) == Decimal("3.5")

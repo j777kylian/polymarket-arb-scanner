@@ -65,6 +65,7 @@ class PaperConfig(BaseModel):
     time_in_force: str = "FAK"  # FOK | FAK
     first_leg: str = "YES"
     force_close_unhedged: bool = True
+    residual_close_retries: int = 3
     min_net_profit: Decimal = Decimal("0.50")
     min_profit_per_share: Decimal = Decimal("0")
     minimum_quantity: Decimal = Decimal("0")

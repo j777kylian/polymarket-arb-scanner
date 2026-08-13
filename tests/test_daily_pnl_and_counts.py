@@ -52,6 +52,7 @@ def test_daily_pnl_not_equal_cumulative(tmp_path, monkeypatch) -> None:
                 status="merged",
                 pnl="80",
                 realized_pnl="80",
+                realized_at=yesterday,
             )
         )
         session.add(
@@ -62,6 +63,7 @@ def test_daily_pnl_not_equal_cumulative(tmp_path, monkeypatch) -> None:
                 status="merged",
                 pnl="20",
                 realized_pnl="20",
+                realized_at=today,
             )
         )
     report_date = today.date().isoformat()

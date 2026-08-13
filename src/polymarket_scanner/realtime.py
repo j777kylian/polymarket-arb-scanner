@@ -281,6 +281,7 @@ class RealtimeScanner:
                     or None,
                     yes_token_id=market.yes_token_id if market else None,
                     no_token_id=market.no_token_id if market else None,
+                    payload=payload if isinstance(payload, dict) else None,
                 )
                 if self.ws:
                     await self.ws.update_subscriptions(list(self.token_to_market.keys()))
@@ -354,6 +355,15 @@ class RealtimeScanner:
             persist_signals(market, signals, sims, episode_ids=episode_ids)
             all_signals.extend(signals)
             process_residuals_with_books(market_id, yes_book, no_book)
+            from polymarket_scanner.simulation.paper_trader import attempt_residual_closes
+
+            attempt_residual_closes(
+                market_id,
+                yes_book,
+                no_book,
+                fees_enabled=bool(market.fees_enabled),
+                fee_schedule=market.fee_schedule,
+            )
             if self._last_ws_received is not None:
                 rec_ms = (now - self._last_ws_received).total_seconds() * 1000.0
                 record_latency("receive_to_recalc", rec_ms, received_at=now)

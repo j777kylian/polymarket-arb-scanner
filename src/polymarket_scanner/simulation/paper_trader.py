@@ -39,6 +39,7 @@ from polymarket_scanner.simulation.inventory import (
     reduce_or_close_position,
     refresh_account_equity,
     set_positions_status,
+    write_account_snapshot,
 )
 from polymarket_scanner.simulation.orderbook_walker import walk_buy_asks
 
@@ -139,9 +140,14 @@ def validate_execution_snapshot(
     max_skew_ms: float,
     episode_open: bool | None = None,
     episode_open_fn: Callable[[int | None], bool] | None = None,
+    require_episode_open: bool = True,
 ) -> str | None:
-    """Return a reject_reason or None if the pair is tradable."""
-    if episode_id is not None:
+    """Return a reject_reason or None if the pair is tradable.
+
+    Before first leg, require_episode_open=True. After first fill, second leg / force-close
+    must not abort solely because the episode closed.
+    """
+    if require_episode_open and episode_id is not None:
         open_flag = episode_open
         if open_flag is None:
             if episode_open_fn is not None:
@@ -982,6 +988,10 @@ def _record_trade(
             row.signal_to_first_ms = meta.signal_to_first_ms
             row.first_to_second_ms = meta.first_to_second_ms
             row.signal_opportunity_id = meta.signal_opportunity_id
+            if hasattr(row, "leg_state"):
+                row.leg_state = meta.leg_state
+            if status in {"merged", "closed", "settled"} and getattr(row, "realized_at", None) is None:
+                row.realized_at = utcnow()
             session.flush()
             meta.trade_id = int(row.id)
             return meta.trade_id
@@ -1053,6 +1063,8 @@ def _record_trade(
         prow.second_fee = second_fee
         prow.signal_to_first_ms = meta.signal_to_first_ms
         prow.first_to_second_ms = meta.first_to_second_ms
+        if status in {"merged", "closed", "settled"} and prow.realized_at is None:
+            prow.realized_at = utcnow()
         session.flush()
         meta.trade_id = int(prow.id)
         return meta.trade_id
@@ -1114,6 +1126,7 @@ async def run_delayed_paper_trade(
         target_time: datetime,
         now: datetime,
         skew_limit: float,
+        require_episode_open: bool = True,
     ) -> str | None:
         ready = True
         if hasattr(cache, "pair_ready") and market.yes_token_id and market.no_token_id:
@@ -1130,7 +1143,208 @@ async def run_delayed_paper_trade(
             max_age_seconds=float(cfg.scanner.max_data_age_seconds),
             max_skew_ms=skew_limit,
             episode_open_fn=episode_open_fn,
+            require_episode_open=require_episode_open,
         )
+
+    def _acct_kwargs() -> dict[str, Any]:
+        return {
+            "account_kind": account_kind,
+            "strategy_id": meta.strategy_id if account_kind == "strategy" else None,
+            "strategy_version": meta.strategy_version if account_kind == "strategy" else None,
+        }
+
+    def _snap(event_type: str, details: str | None = None) -> None:
+        write_account_snapshot(
+            event_type=event_type,
+            trade_id=meta.trade_id,
+            details=details,
+            **_acct_kwargs(),
+        )
+
+    def _status(status: str) -> None:
+        set_positions_status(
+            market.market_id,
+            status,
+            trade_id=meta.trade_id,
+            account_kind=account_kind,
+            strategy_id=meta.strategy_id if account_kind == "strategy" else None,
+            strategy_version=meta.strategy_version if account_kind == "strategy" else None,
+        )
+
+    async def _emergency_close(
+        *,
+        remaining_side: OutcomeSide,
+        remaining_qty: Decimal,
+        remaining_cost: Decimal,
+        matched: Decimal,
+        yes_qty: Decimal,
+        no_qty: Decimal,
+        total_debit: Decimal,
+        buy_fees_total: Decimal,
+        merge_proceeds: Decimal,
+        merge_pnl: Decimal,
+        yes_ref: OrderBookSnapshot | None,
+        no_ref: OrderBookSnapshot | None,
+        first_hash: str,
+        second_hash: str,
+        first_time: str,
+        second_time: str,
+        close_target: datetime,
+    ) -> dict[str, str]:
+        nonlocal sleeper
+        await sleeper(paper.force_close_delay_ms / 1000.0)
+        now_c = now_fn()
+        close_yes, close_no = _capture()
+        creason = _validate(
+            close_yes,
+            close_no,
+            target_time=close_target,
+            now=now_c,
+            skew_limit=float(cfg.scanner.max_book_skew_ms),
+            require_episode_open=False,
+        )
+        close_qty = ZERO
+        close_proceeds = ZERO
+        close_fee = ZERO
+        pnl = merge_pnl
+        rem_qty = remaining_qty
+        rem_cost = remaining_cost
+        if creason or close_yes is None or close_no is None:
+            meta.leg_state = LEG_RESIDUAL_OPEN
+            meta.reject_reason = "close_snapshot_unavailable"
+            _status("RESIDUAL_OPEN")
+            mark_market_books(
+                market.market_id,
+                yes_ref,
+                no_ref,
+                account_kind=account_kind,
+                strategy_id=meta.strategy_id if account_kind == "strategy" else None,
+                strategy_version=meta.strategy_version if account_kind == "strategy" else None,
+            )
+            refresh_account_equity(**_acct_kwargs())
+            _snap("residual_mark", "close_snapshot_unavailable")
+            cash_now, _o, _p = _get_account(account_kind, meta)
+            _record_trade(
+                market.market_id,
+                episode_id,
+                tif,
+                first_delay,
+                "one_leg_merged" if matched > ZERO else "one_leg",
+                yes_qty,
+                no_qty,
+                matched,
+                rem_qty,
+                total_debit,
+                merge_proceeds,
+                pnl,
+                "close_snapshot_unavailable",
+                cash_after=cash_now,
+                remaining_inventory=rem_qty,
+                inventory_cost=rem_cost,
+                buy_fees=buy_fees_total,
+                meta=meta,
+                reject_reason="close_snapshot_unavailable",
+                account_kind=account_kind,
+            )
+            return {
+                "status": "one_leg_merged" if matched > ZERO else "one_leg",
+                "reject_reason": "close_snapshot_unavailable",
+                "pnl": format(pnl, "f"),
+                "leg_state": LEG_RESIDUAL_OPEN,
+                "first_leg_hash": first_hash,
+                "second_leg_hash": second_hash,
+                "first_leg_time": first_time,
+                "second_leg_time": second_time,
+                "cash_after": format(cash_now, "f"),
+                "remaining_inventory": format(rem_qty, "f"),
+            }
+        meta.close_time = close_yes.fetched_at
+        close_book = close_yes if remaining_side == OutcomeSide.YES else close_no
+        close_qty, close_proceeds, close_fee, _, _ = fill_sell(
+            close_book.bids, rem_qty, schedule, fees_enabled=fees_enabled, tif="FAK"
+        )
+        if close_qty > ZERO:
+            close_unit = rem_cost / rem_qty if rem_qty else ZERO
+            closed_cost = close_unit * close_qty
+            close_pnl = close_proceeds - close_fee - closed_cost
+            credit_cash(
+                close_proceeds - close_fee,
+                realized_pnl=close_pnl,
+                account_kind=account_kind,
+                strategy_id=meta.strategy_id,
+                strategy_version=meta.strategy_version,
+            )
+            pnl += close_pnl
+            rem_qty -= close_qty
+            rem_cost -= closed_cost
+            for pos_id, _qty_p, _cost_p, outcome in positions_for_trade(
+                meta.trade_id or 0, account_kind=account_kind
+            ):
+                if outcome.upper() == remaining_side.value:
+                    reduce_or_close_position(
+                        pos_id,
+                        account_kind=account_kind,
+                        qty=close_qty,
+                        cost_released=closed_cost,
+                        mark_price=best_bid(close_book),
+                    )
+            _snap("close", f"closed_qty={close_qty}")
+        if rem_qty > ZERO:
+            meta.leg_state = LEG_RESIDUAL_OPEN
+            _status("RESIDUAL_OPEN")
+            status = "one_leg_merged" if matched > ZERO else "one_leg"
+        elif matched > ZERO:
+            meta.leg_state = LEG_MERGED
+            status = "merged"
+        else:
+            meta.leg_state = LEG_CLOSED
+            status = "closed"
+        mark_market_books(
+            market.market_id,
+            close_yes,
+            close_no,
+            account_kind=account_kind,
+            strategy_id=meta.strategy_id if account_kind == "strategy" else None,
+            strategy_version=meta.strategy_version if account_kind == "strategy" else None,
+        )
+        refresh_account_equity(**_acct_kwargs())
+        cash_now, _o, _p = _get_account(account_kind, meta)
+        _record_trade(
+            market.market_id,
+            episode_id,
+            tif,
+            first_delay,
+            status,
+            yes_qty,
+            no_qty,
+            matched,
+            rem_qty,
+            total_debit,
+            merge_proceeds,
+            pnl,
+            f"emergency_close rem={rem_qty}",
+            cash_after=cash_now,
+            remaining_inventory=rem_qty,
+            inventory_cost=rem_cost,
+            sell_proceeds=close_proceeds,
+            buy_fees=buy_fees_total,
+            sell_fees=close_fee,
+            meta=meta,
+            account_kind=account_kind,
+        )
+        return {
+            "status": status,
+            "pnl": format(pnl, "f"),
+            "realized_pnl": format(pnl, "f"),
+            "cash_after": format(cash_now, "f"),
+            "remaining_inventory": format(rem_qty, "f"),
+            "inventory_cost": format(rem_cost, "f"),
+            "leg_state": meta.leg_state or "",
+            "first_leg_hash": first_hash,
+            "second_leg_hash": second_hash,
+            "first_leg_time": first_time,
+            "second_leg_time": second_time,
+        }
 
     if paper.min_net_profit > ZERO and signal.net_profit < paper.min_net_profit:
         meta.leg_state = LEG_SIGNALLED
@@ -1279,6 +1493,7 @@ async def run_delayed_paper_trade(
                 strategy_id=meta.strategy_id if account_kind == "strategy" else None,
                 strategy_version=meta.strategy_version if account_kind == "strategy" else None,
             )
+            _snap("first_leg_fill", f"qty={f_qty} side={first_side.value}")
 
     first_fill_at = now
     await sleeper(paper.inter_leg_delay_ms / 1000.0)
@@ -1286,16 +1501,163 @@ async def run_delayed_paper_trade(
     second_target = target + timedelta(milliseconds=paper.inter_leg_delay_ms)
     yes2, no2 = _capture()
     reason = _validate(
-        yes2, no2, target_time=second_target, now=now, skew_limit=float(cfg.scanner.max_book_skew_ms)
+        yes2,
+        no2,
+        target_time=second_target,
+        now=now,
+        skew_limit=float(cfg.scanner.max_book_skew_ms),
+        require_episode_open=False,
     )
+    second_failed_reason: str | None = None
+    s_qty = ZERO
+    s_cost = ZERO
+    s_fee = ZERO
+    s_status = "no_fill"
+    matched = ZERO
+    merge_proceeds = ZERO
+    merge_pnl = ZERO
+    unhedged = f_qty
+    remaining_side: OutcomeSide | None = first_side
+    remaining_qty = f_qty
+    remaining_cost = debit
+    yes_qty = f_qty if first_side == OutcomeSide.YES else ZERO
+    no_qty = f_qty if first_side == OutcomeSide.NO else ZERO
+    close_proceeds = ZERO
+    close_fee = ZERO
+
     if reason or yes2 is None or no2 is None:
+        second_failed_reason = reason or "books_not_ready"
         meta.leg_state = LEG_SECOND_FAILED
-        set_positions_status(market.market_id, "RESIDUAL_OPEN", trade_id=meta.trade_id)
-        refresh_account_equity(
-            account_kind=account_kind,
-            strategy_id=meta.strategy_id if account_kind == "strategy" else None,
-            strategy_version=meta.strategy_version if account_kind == "strategy" else None,
-        )
+    else:
+        meta.second_leg_time = yes2.fetched_at
+        meta.first_to_second_ms = (now - first_fill_at).total_seconds() * 1000.0
+        from polymarket_scanner.scanners.pipeline import record_latency as _rl
+
+        _rl("first_to_second_leg", meta.first_to_second_ms)
+
+        second_book = no2 if first == "YES" else yes2
+        second_token = (market.no_token_id if first == "YES" else market.yes_token_id) or ""
+
+        async with _async_lock():
+            with _ACCOUNT_LOCK:
+                cash_mid, _o, _p = _get_account(account_kind, meta)
+                aff2 = affordable_single_leg(
+                    market, second_book.asks, f_qty, cash_mid, safety_buffer=safety_buffer
+                )
+                if aff2 > ZERO and not (tif == "FOK" and aff2 < f_qty):
+                    want = f_qty if tif == "FOK" else min(f_qty, aff2)
+                    s_qty, s_cost, s_fee, _sf, s_status = fill_buy(
+                        second_book.asks, want, schedule, fees_enabled=fees_enabled, tif=tif
+                    )
+                    if cash_mid - s_cost - s_fee < ZERO:
+                        s_qty, s_cost, s_fee, s_status = (
+                            ZERO,
+                            ZERO,
+                            ZERO,
+                            "rejected_insufficient_capital",
+                        )
+                elif tif == "FOK" and aff2 < f_qty:
+                    s_status = "rejected_insufficient_capital"
+
+                if s_qty <= ZERO:
+                    second_failed_reason = (
+                        "second_leg_insufficient_capital"
+                        if "insufficient" in s_status
+                        else s_status
+                    )
+                    meta.leg_state = LEG_SECOND_FAILED
+                    meta.reject_reason = second_failed_reason
+                else:
+                    debit_cash(
+                        s_cost + s_fee,
+                        account_kind=account_kind,
+                        strategy_id=meta.strategy_id,
+                        strategy_version=meta.strategy_version,
+                    )
+                    meta.leg_state = LEG_SECOND_FILLED
+                    meta.second_qty = s_qty
+                    meta.second_vwap = _avg(s_cost, s_qty)
+                    meta.second_fee = s_fee
+                    open_or_increase_position(
+                        market_id=market.market_id,
+                        token_id=second_token,
+                        outcome=second_side.value,
+                        quantity=s_qty,
+                        cost_basis=s_cost + s_fee,
+                        mark_price=best_bid(second_book),
+                        episode_id=episode_id,
+                        trade_id=meta.trade_id,
+                        account_kind=account_kind,
+                        strategy_id=meta.strategy_id,
+                        strategy_version=meta.strategy_version,
+                        status="open",
+                    )
+                    matched = min(f_qty, s_qty)
+                    merge_proceeds = matched * ONE
+                    f_unit = (f_cost + f_fee) / f_qty if f_qty else ZERO
+                    s_unit = (s_cost + s_fee) / s_qty if s_qty else ZERO
+                    matched_cost = f_unit * matched + s_unit * matched
+                    merge_pnl = merge_proceeds - matched_cost
+                    credit_cash(
+                        merge_proceeds,
+                        realized_pnl=merge_pnl,
+                        account_kind=account_kind,
+                        strategy_id=meta.strategy_id,
+                        strategy_version=meta.strategy_version,
+                    )
+                    for pos_id, qty_p, cost_p, outcome in positions_for_trade(
+                        meta.trade_id or 0, account_kind=account_kind
+                    ):
+                        unit = cost_p / qty_p if qty_p else ZERO
+                        reduce_or_close_position(
+                            pos_id,
+                            account_kind=account_kind,
+                            qty=min(matched, qty_p),
+                            cost_released=unit * min(matched, qty_p),
+                            mark_price=best_bid(yes2 if outcome.upper() == "YES" else no2),
+                        )
+                    _snap("second_leg_fill", f"qty={s_qty}")
+                    _snap("merge", f"matched={matched} pnl={merge_pnl}")
+
+                    yes_qty = f_qty if first_side == OutcomeSide.YES else s_qty
+                    no_qty = f_qty if first_side == OutcomeSide.NO else s_qty
+                    unhedged = abs(f_qty - s_qty)
+                    remaining_side = None
+                    remaining_qty = unhedged
+                    remaining_cost = ZERO
+                    if f_qty > s_qty:
+                        remaining_side = first_side
+                        remaining_cost = f_unit * (f_qty - s_qty)
+                    elif s_qty > f_qty:
+                        remaining_side = second_side
+                        remaining_cost = s_unit * (s_qty - f_qty)
+
+                    if unhedged > ZERO and paper.force_close_unhedged:
+                        meta.leg_state = LEG_CLOSE_PENDING
+                        _record_trade(
+                            market.market_id,
+                            episode_id,
+                            tif,
+                            first_delay,
+                            LEG_CLOSE_PENDING,
+                            yes_qty,
+                            no_qty,
+                            matched,
+                            unhedged,
+                            debit + s_cost + s_fee,
+                            merge_proceeds,
+                            merge_pnl,
+                            "close pending",
+                            cash_after=_get_account(account_kind, meta)[0],
+                            remaining_inventory=remaining_qty,
+                            inventory_cost=remaining_cost,
+                            buy_fees=f_fee + s_fee,
+                            meta=meta,
+                            account_kind=account_kind,
+                        )
+
+    if second_failed_reason is not None:
+        refresh_account_equity(**_acct_kwargs())
         cash_now, _o, _p = _get_account(account_kind, meta)
         _record_trade(
             market.market_id,
@@ -1310,282 +1672,82 @@ async def run_delayed_paper_trade(
             debit,
             ZERO,
             ZERO,
-            "second_leg " + (reason or "books_not_ready"),
+            f"second_leg {second_failed_reason}",
             cash_after=cash_now,
             remaining_inventory=f_qty,
             inventory_cost=debit,
             buy_fees=f_fee,
             meta=meta,
-            reject_reason=reason or "books_not_ready",
+            reject_reason=second_failed_reason,
             account_kind=account_kind,
         )
+        if paper.force_close_unhedged:
+            return await _emergency_close(
+                remaining_side=first_side,
+                remaining_qty=f_qty,
+                remaining_cost=debit,
+                matched=ZERO,
+                yes_qty=yes_qty,
+                no_qty=no_qty,
+                total_debit=debit,
+                buy_fees_total=f_fee,
+                merge_proceeds=ZERO,
+                merge_pnl=ZERO,
+                yes_ref=yes2 or yes1,
+                no_ref=no2 or no1,
+                first_hash=yes1.hash or "",
+                second_hash=(yes2.hash if yes2 else "") or "",
+                first_time=yes1.fetched_at.isoformat(),
+                second_time=yes2.fetched_at.isoformat() if yes2 else "",
+                close_target=second_target + timedelta(milliseconds=paper.force_close_delay_ms),
+            )
+        _status("RESIDUAL_OPEN")
+        mark_market_books(
+            market.market_id,
+            yes2 or yes1,
+            no2 or no1,
+            account_kind=account_kind,
+            strategy_id=meta.strategy_id if account_kind == "strategy" else None,
+            strategy_version=meta.strategy_version if account_kind == "strategy" else None,
+        )
+        _snap("residual_mark", second_failed_reason)
         return {
             "status": "one_leg",
-            "reject_reason": reason or "books_not_ready",
+            "reject_reason": second_failed_reason,
             "pnl": "0",
             "leg_state": LEG_SECOND_FAILED,
             "first_leg_hash": yes1.hash or "",
-            "second_leg_hash": "",
+            "second_leg_hash": (yes2.hash if yes2 else "") or "",
             "first_leg_time": yes1.fetched_at.isoformat(),
-            "second_leg_time": "",
+            "second_leg_time": yes2.fetched_at.isoformat() if yes2 else "",
             "cash_after": format(cash_now, "f"),
             "remaining_inventory": format(f_qty, "f"),
         }
 
-    meta.second_leg_time = yes2.fetched_at
-    meta.first_to_second_ms = (now - first_fill_at).total_seconds() * 1000.0
-    from polymarket_scanner.scanners.pipeline import record_latency as _rl
-
-    _rl("first_to_second_leg", meta.first_to_second_ms)
-
-    second_book = no2 if first == "YES" else yes2
-    second_token = (market.no_token_id if first == "YES" else market.yes_token_id) or ""
-
-    async with _async_lock():
-        with _ACCOUNT_LOCK:
-            cash_mid, _o, _p = _get_account(account_kind, meta)
-            aff2 = affordable_single_leg(
-                market, second_book.asks, f_qty, cash_mid, safety_buffer=safety_buffer
-            )
-            s_qty = ZERO
-            s_cost = ZERO
-            s_fee = ZERO
-            s_status = "no_fill"
-            if aff2 > ZERO and not (tif == "FOK" and aff2 < f_qty):
-                want = f_qty if tif == "FOK" else min(f_qty, aff2)
-                s_qty, s_cost, s_fee, _sf, s_status = fill_buy(
-                    second_book.asks, want, schedule, fees_enabled=fees_enabled, tif=tif
-                )
-                if cash_mid - s_cost - s_fee < ZERO:
-                    s_qty, s_cost, s_fee, s_status = ZERO, ZERO, ZERO, "rejected_insufficient_capital"
-            elif tif == "FOK" and aff2 < f_qty:
-                s_status = "rejected_insufficient_capital"
-
-            if s_qty <= ZERO:
-                meta.leg_state = LEG_SECOND_FAILED
-                set_positions_status(market.market_id, "RESIDUAL_OPEN", trade_id=meta.trade_id)
-                refresh_account_equity(
-                    account_kind=account_kind,
-                    strategy_id=meta.strategy_id if account_kind == "strategy" else None,
-                    strategy_version=meta.strategy_version if account_kind == "strategy" else None,
-                )
-                cash_now, _o, _p = _get_account(account_kind, meta)
-                _record_trade(
-                    market.market_id,
-                    episode_id,
-                    tif,
-                    first_delay,
-                    "one_leg",
-                    yes_qty,
-                    no_qty,
-                    ZERO,
-                    f_qty,
-                    debit,
-                    ZERO,
-                    ZERO,
-                    f"second_leg {s_status} remaining_cash={cash_mid} aff2={aff2}",
-                    cash_after=cash_now,
-                    remaining_inventory=f_qty,
-                    inventory_cost=debit,
-                    buy_fees=f_fee,
-                    meta=meta,
-                    reject_reason="second_leg_insufficient_capital"
-                    if "insufficient" in s_status
-                    else s_status,
-                    account_kind=account_kind,
-                )
-                return {
-                    "status": "one_leg",
-                    "reject_reason": meta.reject_reason or s_status,
-                    "pnl": "0",
-                    "leg_state": LEG_SECOND_FAILED,
-                    "first_leg_hash": yes1.hash or "",
-                    "second_leg_hash": yes2.hash or "",
-                    "first_leg_time": yes1.fetched_at.isoformat(),
-                    "second_leg_time": yes2.fetched_at.isoformat(),
-                    "cash_after": format(cash_now, "f"),
-                    "remaining_inventory": format(f_qty, "f"),
-                }
-
-            debit_cash(
-                s_cost + s_fee,
-                account_kind=account_kind,
-                strategy_id=meta.strategy_id,
-                strategy_version=meta.strategy_version,
-            )
-            meta.second_qty = s_qty
-            meta.second_vwap = _avg(s_cost, s_qty)
-            meta.second_fee = s_fee
-            open_or_increase_position(
-                market_id=market.market_id,
-                token_id=second_token,
-                outcome=second_side.value,
-                quantity=s_qty,
-                cost_basis=s_cost + s_fee,
-                mark_price=best_bid(second_book),
-                episode_id=episode_id,
-                trade_id=meta.trade_id,
-                account_kind=account_kind,
-                strategy_id=meta.strategy_id,
-                strategy_version=meta.strategy_version,
-                status="open",
-            )
-            matched = min(f_qty, s_qty)
-            merge_proceeds = matched * ONE
-            f_unit = (f_cost + f_fee) / f_qty if f_qty else ZERO
-            s_unit = (s_cost + s_fee) / s_qty if s_qty else ZERO
-            matched_cost = f_unit * matched + s_unit * matched
-            merge_pnl = merge_proceeds - matched_cost
-            credit_cash(
-                merge_proceeds,
-                realized_pnl=merge_pnl,
-                account_kind=account_kind,
-                strategy_id=meta.strategy_id,
-                strategy_version=meta.strategy_version,
-            )
-            for pos_id, qty_p, cost_p, outcome in positions_for_trade(
-                meta.trade_id or 0, account_kind=account_kind
-            ):
-                unit = cost_p / qty_p if qty_p else ZERO
-                reduce_or_close_position(
-                    pos_id,
-                    account_kind=account_kind,
-                    qty=min(matched, qty_p),
-                    cost_released=unit * min(matched, qty_p),
-                    mark_price=best_bid(yes2 if outcome.upper() == "YES" else no2),
-                )
-
-            yes_qty = f_qty if first_side == OutcomeSide.YES else s_qty
-            no_qty = f_qty if first_side == OutcomeSide.NO else s_qty
-            unhedged = abs(f_qty - s_qty)
-            remaining_side = None
-            remaining_qty = unhedged
-            remaining_cost = ZERO
-            if f_qty > s_qty:
-                remaining_side = first_side
-                remaining_cost = f_unit * (f_qty - s_qty)
-            elif s_qty > f_qty:
-                remaining_side = second_side
-                remaining_cost = s_unit * (s_qty - f_qty)
-
-            close_qty = ZERO
-            close_proceeds = ZERO
-            close_fee = ZERO
-            if unhedged > ZERO and paper.force_close_unhedged:
-                meta.leg_state = LEG_CLOSE_PENDING
-                _record_trade(
-                    market.market_id,
-                    episode_id,
-                    tif,
-                    first_delay,
-                    LEG_CLOSE_PENDING,
-                    yes_qty,
-                    no_qty,
-                    matched,
-                    unhedged,
-                    debit + s_cost + s_fee,
-                    merge_proceeds,
-                    merge_pnl,
-                    "close pending",
-                    cash_after=_get_account(account_kind, meta)[0],
-                    remaining_inventory=remaining_qty,
-                    inventory_cost=remaining_cost,
-                    buy_fees=f_fee + s_fee,
-                    meta=meta,
-                    account_kind=account_kind,
-                )
-
-    if unhedged > ZERO and paper.force_close_unhedged:
-        await sleeper(paper.force_close_delay_ms / 1000.0)
-        now = now_fn()
-        close_target = second_target + timedelta(milliseconds=paper.force_close_delay_ms)
-        close_yes, close_no = _capture()
-        creason = _validate(
-            close_yes,
-            close_no,
-            target_time=close_target,
-            now=now,
-            skew_limit=float(cfg.scanner.max_book_skew_ms),
+    if unhedged > ZERO and paper.force_close_unhedged and remaining_side is not None:
+        return await _emergency_close(
+            remaining_side=remaining_side,
+            remaining_qty=remaining_qty,
+            remaining_cost=remaining_cost,
+            matched=matched,
+            yes_qty=yes_qty,
+            no_qty=no_qty,
+            total_debit=debit + s_cost + s_fee,
+            buy_fees_total=f_fee + s_fee,
+            merge_proceeds=merge_proceeds,
+            merge_pnl=merge_pnl,
+            yes_ref=yes2,
+            no_ref=no2,
+            first_hash=yes1.hash or "",
+            second_hash=(yes2.hash or "") if yes2 else "",
+            first_time=yes1.fetched_at.isoformat(),
+            second_time=yes2.fetched_at.isoformat() if yes2 else "",
+            close_target=second_target + timedelta(milliseconds=paper.force_close_delay_ms),
         )
-        if creason or close_yes is None or close_no is None:
-            meta.leg_state = LEG_RESIDUAL_OPEN
-            meta.reject_reason = "close_snapshot_unavailable"
-            set_positions_status(market.market_id, "RESIDUAL_OPEN", trade_id=meta.trade_id)
-            mark_market_books(market.market_id, yes2, no2, status="RESIDUAL_OPEN")
-            refresh_account_equity(
-                account_kind=account_kind,
-                strategy_id=meta.strategy_id if account_kind == "strategy" else None,
-                strategy_version=meta.strategy_version if account_kind == "strategy" else None,
-            )
-            cash_now, _o, _p = _get_account(account_kind, meta)
-            _record_trade(
-                market.market_id,
-                episode_id,
-                tif,
-                first_delay,
-                "one_leg_merged" if matched > ZERO else "one_leg",
-                yes_qty,
-                no_qty,
-                matched,
-                remaining_qty,
-                debit + s_cost + s_fee,
-                merge_proceeds,
-                merge_pnl,
-                "close_snapshot_unavailable",
-                cash_after=cash_now,
-                remaining_inventory=remaining_qty,
-                inventory_cost=remaining_cost,
-                buy_fees=f_fee + s_fee,
-                meta=meta,
-                reject_reason="close_snapshot_unavailable",
-                account_kind=account_kind,
-            )
-            return {
-                "status": "one_leg_merged" if matched > ZERO else "one_leg",
-                "reject_reason": "close_snapshot_unavailable",
-                "pnl": format(merge_pnl, "f"),
-                "leg_state": LEG_RESIDUAL_OPEN,
-                "first_leg_hash": yes1.hash or "",
-                "second_leg_hash": yes2.hash or "",
-                "first_leg_time": yes1.fetched_at.isoformat(),
-                "second_leg_time": yes2.fetched_at.isoformat(),
-                "cash_after": format(cash_now, "f"),
-                "remaining_inventory": format(remaining_qty, "f"),
-            }
-        meta.close_time = close_yes.fetched_at
-        close_book = close_yes if remaining_side == OutcomeSide.YES else close_no
-        close_qty, close_proceeds, close_fee, _, _ = fill_sell(
-            close_book.bids, remaining_qty, schedule, fees_enabled=fees_enabled, tif="FAK"
-        )
-        if close_qty > ZERO:
-            close_unit = remaining_cost / remaining_qty if remaining_qty else ZERO
-            closed_cost = close_unit * close_qty
-            close_pnl = close_proceeds - close_fee - closed_cost
-            credit_cash(
-                close_proceeds - close_fee,
-                realized_pnl=close_pnl,
-                account_kind=account_kind,
-                strategy_id=meta.strategy_id,
-                strategy_version=meta.strategy_version,
-            )
-            merge_pnl += close_pnl
-            remaining_qty -= close_qty
-            remaining_cost -= closed_cost
-            for pos_id, _qty_p, _cost_p, outcome in positions_for_trade(
-                meta.trade_id or 0, account_kind=account_kind
-            ):
-                if remaining_side and outcome.upper() == remaining_side.value:
-                    reduce_or_close_position(
-                        pos_id,
-                        account_kind=account_kind,
-                        qty=close_qty,
-                        cost_released=closed_cost,
-                        mark_price=best_bid(close_book),
-                    )
 
     if remaining_qty > ZERO:
         meta.leg_state = LEG_RESIDUAL_OPEN
-        set_positions_status(market.market_id, "RESIDUAL_OPEN", trade_id=meta.trade_id)
+        _status("RESIDUAL_OPEN")
         status = "one_leg_merged" if matched > ZERO else "one_leg"
     elif matched > ZERO:
         meta.leg_state = LEG_MERGED
@@ -1594,12 +1756,15 @@ async def run_delayed_paper_trade(
         meta.leg_state = LEG_CLOSED
         status = "closed"
 
-    mark_market_books(market.market_id, yes2, no2)
-    refresh_account_equity(
+    mark_market_books(
+        market.market_id,
+        yes2,
+        no2,
         account_kind=account_kind,
         strategy_id=meta.strategy_id if account_kind == "strategy" else None,
         strategy_version=meta.strategy_version if account_kind == "strategy" else None,
     )
+    refresh_account_equity(**_acct_kwargs())
     cash_now, _o, pnl_now = _get_account(account_kind, meta)
     meta.actual_execution_time = now_fn()
     meta.execution_book_hashes = (
@@ -1628,6 +1793,10 @@ async def run_delayed_paper_trade(
         meta=meta,
         account_kind=account_kind,
     )
+    if status in {"merged", "closed"}:
+        _snap("merge" if status == "merged" else "close")
+    elif remaining_qty > ZERO:
+        _snap("residual_mark")
     return {
         "status": status,
         "pnl": format(merge_pnl, "f"),
@@ -1637,7 +1806,135 @@ async def run_delayed_paper_trade(
         "inventory_cost": format(remaining_cost, "f"),
         "leg_state": meta.leg_state or "",
         "first_leg_hash": yes1.hash or "",
-        "second_leg_hash": yes2.hash or "",
+        "second_leg_hash": (yes2.hash or "") if yes2 else "",
         "first_leg_time": yes1.fetched_at.isoformat(),
-        "second_leg_time": yes2.fetched_at.isoformat(),
+        "second_leg_time": yes2.fetched_at.isoformat() if yes2 else "",
     }
+
+
+def attempt_residual_closes(
+    market_id: str,
+    yes_book: OrderBookSnapshot | None,
+    no_book: OrderBookSnapshot | None,
+    *,
+    fees_enabled: bool = False,
+    fee_schedule: Any | None = None,
+    max_retries: int | None = None,
+) -> int:
+    """Retry selling RESIDUAL_OPEN inventory when a later valid book arrives."""
+    from polymarket_scanner.database import PositionRow, StrategyPositionRow
+
+    cfg = get_config()
+    limit = cfg.paper.residual_close_retries if max_retries is None else max_retries
+    if limit <= 0 or yes_book is None or no_book is None:
+        return 0
+    closed = 0
+    with session_scope() as session:
+        live = list(
+            session.scalars(
+                select(PositionRow).where(
+                    PositionRow.market_id == market_id,
+                    PositionRow.status.in_(["RESIDUAL_OPEN", "residual_open"]),
+                )
+            ).all()
+        )
+        strat = list(
+            session.scalars(
+                select(StrategyPositionRow).where(
+                    StrategyPositionRow.market_id == market_id,
+                    StrategyPositionRow.status.in_(["RESIDUAL_OPEN", "residual_open"]),
+                )
+            ).all()
+        )
+    jobs: list[tuple[str, Any]] = [("live", r) for r in live] + [("strategy", r) for r in strat]
+    for kind, row in jobs:
+        trade_id = int(row.trade_id) if row.trade_id is not None else None
+        if trade_id is None:
+            continue
+        with session_scope() as session:
+            trade: Any
+            if kind == "strategy":
+                trade = session.get(StrategyTradeRow, trade_id)
+            else:
+                trade = session.get(PaperTradeRow, trade_id)
+            if trade is None:
+                continue
+            attempts = int(getattr(trade, "close_attempts", 0) or 0)
+            if attempts >= limit:
+                continue
+            trade.close_attempts = attempts + 1
+            session.flush()
+        qty = _d(row.quantity)
+        cost = _d(row.cost_basis)
+        if qty <= ZERO:
+            continue
+        book = yes_book if str(row.outcome).upper() == "YES" else no_book
+        schedule = fee_schedule
+        cq, proceeds, fee, _, _ = fill_sell(
+            book.bids, qty, schedule, fees_enabled=fees_enabled, tif="FAK"
+        )
+        if cq <= ZERO:
+            with session_scope() as session:
+                trade = (
+                    session.get(StrategyTradeRow, trade_id)
+                    if kind == "strategy"
+                    else session.get(PaperTradeRow, trade_id)
+                )
+                if trade is not None:
+                    trade.details = (trade.details or "") + f"|close_retry_{attempts + 1}=no_fill"
+            continue
+        unit = cost / qty
+        closed_cost = unit * cq
+        close_pnl = proceeds - fee - closed_cost
+        sid = getattr(row, "strategy_id", None)
+        sver = getattr(row, "strategy_version", None)
+        credit_cash(
+            proceeds - fee,
+            realized_pnl=close_pnl,
+            account_kind=kind,
+            strategy_id=sid,
+            strategy_version=sver,
+        )
+        reduce_or_close_position(
+            int(row.id),
+            account_kind=kind,
+            qty=cq,
+            cost_released=closed_cost,
+            mark_price=best_bid(book),
+        )
+        rem = qty - cq
+        with session_scope() as session:
+            trade = (
+                session.get(StrategyTradeRow, trade_id)
+                if kind == "strategy"
+                else session.get(PaperTradeRow, trade_id)
+            )
+            if trade is not None:
+                trade.realized_pnl = format(_d(trade.realized_pnl or getattr(trade, "pnl", None)) + close_pnl, "f")
+                if hasattr(trade, "pnl"):
+                    trade.pnl = trade.realized_pnl
+                trade.remaining_inventory = format(rem, "f")
+                trade.inventory_cost = format(max(ZERO, cost - closed_cost), "f")
+                trade.details = (trade.details or "") + f"|close_retry_{attempts + 1}=qty={cq}"
+                if rem <= ZERO:
+                    trade.status = "closed"
+                    trade.leg_state = LEG_CLOSED
+                    trade.realized_at = utcnow()
+                else:
+                    trade.status = "one_leg"
+                    trade.leg_state = LEG_RESIDUAL_OPEN
+        write_account_snapshot(
+            event_type="close",
+            account_kind=kind,
+            strategy_id=sid if kind == "strategy" else None,
+            strategy_version=sver if kind == "strategy" else None,
+            trade_id=trade_id,
+            details=f"residual_retry qty={cq}",
+        )
+        refresh_account_equity(
+            account_kind=kind,
+            strategy_id=sid if kind == "strategy" else None,
+            strategy_version=sver if kind == "strategy" else None,
+        )
+        closed += 1
+    return closed

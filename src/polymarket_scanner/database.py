@@ -461,6 +461,9 @@ class PaperTradeRow(Base):
     second_fee: Mapped[str | None] = mapped_column(String(32), nullable=True)
     signal_to_first_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     first_to_second_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_attempts: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class PositionRow(Base):
@@ -578,6 +581,10 @@ class StrategyTradeRow(Base):
     signal_to_first_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     first_to_second_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     signal_opportunity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    realized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    leg_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class StrategyEvalRow(Base):
@@ -595,6 +602,28 @@ class StrategyEvalRow(Base):
     recommended_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AccountSnapshotRow(Base):
+    """Auditable account time series after paper events."""
+
+    __tablename__ = "account_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    account_kind: Mapped[str] = mapped_column(String(16), index=True)  # live | strategy
+    strategy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    cash: Mapped[str] = mapped_column(String(32), default="0")
+    occupied_cost: Mapped[str] = mapped_column(String(32), default="0")
+    marked_inventory: Mapped[str] = mapped_column(String(32), default="0")
+    equity: Mapped[str] = mapped_column(String(32), default="0")
+    realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    unrealized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    drawdown: Mapped[str] = mapped_column(String(32), default="0")
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 _engine: Any = None
@@ -760,6 +789,13 @@ def _ensure_schema(engine) -> None:
         ("strategy_trades", "signal_to_first_ms", "FLOAT"),
         ("strategy_trades", "first_to_second_ms", "FLOAT"),
         ("strategy_trades", "signal_opportunity_id", "INTEGER"),
+        ("paper_trades", "realized_at", "DATETIME"),
+        ("paper_trades", "settled_at", "DATETIME"),
+        ("paper_trades", "close_attempts", "INTEGER DEFAULT 0"),
+        ("strategy_trades", "realized_at", "DATETIME"),
+        ("strategy_trades", "settled_at", "DATETIME"),
+        ("strategy_trades", "close_attempts", "INTEGER DEFAULT 0"),
+        ("strategy_trades", "leg_state", "VARCHAR(32)"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in specs:
