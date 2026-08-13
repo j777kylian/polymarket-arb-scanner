@@ -33,6 +33,7 @@ scanner:
   observed_delay_tolerance_ms: 250
   ws_persist_min_interval_ms: 400
   min_walk_forward_trades: 30
+  new_market_resync_cooldown_seconds: 30
 
 paper:
   enabled: false

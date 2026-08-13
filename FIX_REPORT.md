@@ -1,118 +1,121 @@
-# FIX_REPORT — polymarket-arb-scanner (post-92c5a2f)
+# FIX_REPORT — polymarket-arb-scanner (post-21bcea7)
 
 All results remain **simulated / paper-only**. `TRADING_ENABLED=False`. No wallet, private key, signing, or `POST /order`.
 
-This round continues from commit `92c5a2f`. Prior cashflow / book-lifecycle / rule-engine fixes are unchanged.
+This round continues from commit `21bcea7`. State machine, cash, and residual behaviour are proven by database tests, not by this report alone.
 
 ---
 
 ## 已修复
 
-### 1. 产品结构：Snapshot Audit / Live Research
+### 1. Paper 两腿状态机（立即第一腿成交）
 
-- UI / CLI / README / Docker 不再使用 Phase 1/2/3。
-- **Snapshot Audit** = `--once` 单次 REST scan（保留，用于 API / 费用 / 盘口 / 公式诊断）。
-- **Live Research** = `--daemon --mode live`，Execution Mode = Observe Only / Paper Trading。
-- 删除 static REST **持续轮询 daemon**。`--daemon --mode static|snapshot` 直接拒绝。
-- Paper Trading **复用** `RealtimeScanner` + `LiveBookCache`，没有第二套盘口逻辑。
-- Docker 默认 `scanner` 为 Live Research（Observe Only）；`--profile paper` 为 Paper Trading。
+`run_delayed_paper_trade` 不再等第二腿验证后再一次性提交两腿。
 
-### 2. WebSocket 官方 payload
+第一腿 snapshot 有效后立即：模拟成交、扣现金、写入 `PositionRow`、`leg_state=FIRST_LEG_FILLED`。
 
-首次连接：
+状态：`SIGNALLED`、`FIRST_LEG_FILLED`、`SECOND_LEG_FILLED`、`SECOND_LEG_FAILED`、`CLOSE_PENDING`、`RESIDUAL_OPEN`、`MERGED`、`CLOSED`。
 
-```json
-{"assets_ids": [...], "type": "market", "initial_dump": true, "custom_feature_enabled": true}
+第二腿 snapshot 无效时保留第一腿敞口（`one_leg` / `SECOND_LEG_FAILED`），整笔不为 0。测试：`test_second_snapshot_invalid_after_first_fill_leaves_exposure` 断言 `cash < 1000`、`cash >= 0`、`PositionRow.quantity > 0`。
+
+### 2. 资本约束（不预支 merge proceeds）
+
+第一腿只按单腿 `affordable_single_leg` 从当前现金计价；扣款后再按剩余现金给第二腿重新计价。中间任意时刻 `cash >= 0`。
+
+回归：`starting_cash=1000`，YES ask 0.01 × 10000（成本 100），NO ask 0.99 × 10000（成本 9900）禁止完整成交 10,000 对。测试：`test_second_leg_cannot_spend_future_merge_proceeds`。
+
+### 3. 强平 snapshot 无效 → 残仓
+
+禁止回退到第二腿旧盘口。`reject_reason=close_snapshot_unavailable`，`leg_state=RESIDUAL_OPEN`。`simulation/inventory.py` 在后续有效盘口上 mark-to-market，在 `market_resolved` 时按胜负 1/0 更新残仓。测试：`test_invalid_close_snapshot_preserves_residual`。
+
+### 4. PositionRow / StrategyPositionRow 与 equity
+
+字段：`market_id`、`token_id`、`outcome`、`quantity`、`cost_basis`、`acquired_at`、`last_mark_price`、`marked_value`、`unrealized_pnl`、`status`。
+
+保守市值 = 当前 best bid。`equity = cash + marked_value`，occupied cost 不再冒充市值。UI Paper / Strategies 分开显示 cost basis 与 marked value。测试：`test_residual_mark_to_market_changes_equity_drawdown`。
+
+### 5. Shadow 独立候选宇宙
+
+Shadow 吃同一批 raw forward episodes（books ready、非 stale/skew、net>0），不受 live Balanced 或主 `--paper` 开关控制。Observe Only 仍跑 shadow。
+
+每策略独立跟踪 eligibility False→True，每个 episode 只 attempt 一次。`shadow_fast`（`min_net_profit=0.25`）能看到 0.25–0.50 的机会。测试：`test_shadow_candidate_universe_independent_from_live_rule`、`test_eligibility_false_to_true_triggers_once`。
+
+### 6. Walk-forward 无 validation leakage
+
+训练窗口只选候选；验证窗口只评估训练期选出的策略。禁止用验证 P&L 重选。窗口指标只来自该窗口 `StrategyTradeRow`。禁止用累计 `StrategyAccountRow` 覆盖 validation P&L。测试：`test_walk_forward_has_no_validation_leakage`（训练赢家 A，验证赢家 B，推荐仍为 A；A 的 validation realized=1 而不是账户 999）。
+
+### 7. `market_resolved` condition ID
+
+`RealtimeScanner.condition_to_market_id`。官方 payload `{"event_type":"market_resolved","market":"<condition_id>"}` 能关 episode、退订、更新残仓。测试：`test_condition_id_market_resolved`。
+
+### 8. 延迟指标拆分
+
+`book` / `market_book` 记为 `initial_snapshot_age`，不进 feed p50/p95。Feed 只统计 `price_change`（及 `last_trade_price`）。另记 `receive_to_recalc`、`signal_to_first_leg`、`first_to_second_leg`。测试：`test_initial_book_age_excluded_from_feed_latency`。
+
+### 9. `new_market` resync debounce
+
+订阅后 `new_market_resync_cooldown_seconds`（默认 30s）内的批量 `new_market` 不立刻触发全量 Gamma。
+
+### 10. 自动日报跨日
+
+`previous_report_date_due`：日期滚动时生成 **previous** 本地日期，而不是今天的空报。`reporting.timezone` 用于日界和 rollover（Settings 中有说明）。测试：`test_previous_day_daily_report`。
+
+### 11. Docker profiles 互斥
+
+Observe scanner：`profiles: ["observe"]`。Paper scanner：`profiles: ["paper"]`。UI 无 profile。
+
+```bash
+docker compose --profile paper up     # UI + Paper scanner
+docker compose --profile observe up   # UI + Observe scanner
 ```
 
-动态新增：`operation=subscribe` + `custom_feature_enabled`（**禁止** `type=market`）。
+`docker compose up` 只起 UI。测试：`test_docker_paper_profile_does_not_start_observe_scanner`。
 
-动态删除：`operation=unsubscribe`（**禁止** `type=unsubscribe`）。
+### 12. persist_signals → opportunity IDs
 
-`ws_subscribe_chunk: 0` 时一次发送全部 token。若仍分块：仅第一块 `type=market`，后续块 `operation=subscribe`。
+返回 `list[int]`；写入 `OpportunityEpisodeRow.last_opportunity_id`；`PaperTrade.signal_opportunity_id` 指向触发的 `OpportunityRow`。测试：`test_paper_trade_links_exact_opportunity_row`。
 
-处理 `tick_size_change` / `new_market` / `market_resolved`。`market_resolved` 与 removed 关闭对应 episode。
+### 13. Strategy UI 与 Run 生命周期
 
-### 3. CLI 配置传递
-
-`ScannerService.run_daemon` 在 overlay `--max-pages` / `--market-limit` 之后构造：
-
-```python
-RealtimeScanner(config=self.cfg, paper=paper)
-```
-
-`RealtimeScanner` 不再 `apply_runtime_to_config(get_config())`，运行循环也不再覆盖 CLI。
-
-`ScannerRunRow` 记录 `discovered_markets`、`subscribed_markets`、`subscribed_tokens`、`ready_market_pairs`、`fee_schedule_coverage`、`mode`。
-
-### 4. Paper 分腿真实性
-
-Signal 后等待 `signal_to_first_leg_ms`，校验 episode open / pair ready / generation / stale / skew / `snapshot_time >= target_time`。模拟第一腿；等待 `inter_leg_delay_ms` 后取**新**第二腿快照；残仓则在 `force_close_delay_ms` 后取第三本簿平仓。每次拒绝写入明确 `reject_reason`。残仓成本仍是 occupied inventory，不是已实现亏损。
-
-`PaperTradeRow` 增加 strategy / 时间戳 / book hash / expected vs realized 字段。账户跟踪 peak equity、max drawdown、marked inventory。
-
-### 5. 日报
-
-- Daily realized P&L = 当天 `PaperTradeRow.created_at` 的 `realized_pnl` 之和。
-- 同时展示 cumulative realized、cash、occupied inventory cost、marked inventory、equity、max drawdown。
-- Live Research 受 `market_limit` 限制时，Markets scanned = `subscribed_markets`，不是数据库全部市场。
-- daemon 启动把 `last_report_date` 设为今天，避免启动瞬间空报告；停止时重新查库生成。
-
-### 6. Shadow 策略比较（只建议，不自动改参）
-
-表：`strategy_configs` / `strategy_runs` / `strategy_accounts` / `strategy_trades` / `strategy_evals`。版本不可变；历史交易保留当时 `strategy_version`。多 shadow 共用同一组 LiveBookCache 快照，账户资金互不占用。Walk-forward 训练/验证窗口严格分离；样本不足（默认 &lt; 30 笔验证交易）不推荐。推荐不会写入运行中 paper 参数。
+Strategies 页：查看/创建新版本（只 INSERT，不 UPDATE `params_json`）、启用/停用、账户、交易、持仓、walk-forward。Live Research 启动 `start_strategy_runs()`，停止 `finish_open_strategy_runs()`。`StrategyTrade` 保存两腿时间、数量、价格、费用、hash、延迟、`signal_opportunity_id`。
 
 ---
 
 ## 测试覆盖
 
-`pytest -q` 新增/更新：
+`pytest -q`：110 passed。新增 `tests/test_round3_fixes.py`：
 
 | 要求 | 测试 |
 |------|------|
-| 官方动态 WS 订阅 payload | `tests/test_market_ws.py` |
-| CLI realtime 参数不丢失 | `tests/test_cli_realtime_config.py` |
-| 500ms 后 episode 消失不成交 | `test_episode_closed_after_delay_does_not_fill` |
-| 延迟后 stale / skewed 拒绝 | `test_stale_or_skewed_books_rejected` |
-| 两腿使用不同时间快照 | `test_two_legs_use_different_time_snapshots` |
-| tick_size_change 更新 | `tests/test_tick_size_ws.py` |
-| daily P&L ≠ 累计 P&L | `test_daily_pnl_not_equal_cumulative` |
-| realtime market count | `test_realtime_market_count_uses_subscribed_not_all_db` |
-| shadow 账户隔离 | `test_shadow_strategy_accounts_are_isolated` |
-| 样本不足不推荐 | `test_walk_forward_insufficient_sample_does_not_recommend` |
+| 第二腿 snapshot 无效保留敞口 | `test_second_snapshot_invalid_after_first_fill_leaves_exposure` |
+| 第二腿不能花未来 merge 款 | `test_second_leg_cannot_spend_future_merge_proceeds` |
+| 无效强平 snapshot 留残仓 | `test_invalid_close_snapshot_preserves_residual` |
+| 残仓 MTM 改 equity/drawdown | `test_residual_mark_to_market_changes_equity_drawdown` |
+| Shadow 宇宙独立于 live rule | `test_shadow_candidate_universe_independent_from_live_rule` |
+| eligibility False→True 一次 | `test_eligibility_false_to_true_triggers_once` |
+| walk-forward 无 validation leakage | `test_walk_forward_has_no_validation_leakage` |
+| condition-id market_resolved | `test_condition_id_market_resolved` |
+| 初始 book age 不进 feed latency | `test_initial_book_age_excluded_from_feed_latency` |
+| 跨日生成前一日日报 | `test_previous_day_daily_report` |
+| Docker paper 不起 observe | `test_docker_paper_profile_does_not_start_observe_scanner` |
+| PaperTrade 链到 OpportunityRow | `test_paper_trade_links_exact_opportunity_row` |
 
-既有 paper cashflow / book lifecycle / rule engine 测试保留。
+`ruff check src tests` 通过。`mypy src` 通过。
 
 ---
 
 ## 真实 API 验证
 
-本轮**没有**对 Polymarket 生产 WebSocket 或 Gamma/CLOB 做联机验证。
+本轮没有对 Polymarket 生产 WebSocket / Gamma / CLOB 做联机验证。
 
-未验证：
-
-- `operation=subscribe` / `unsubscribe` 在当前 CLOB 网关上的接受情况（按官方文档构造；发送失败仍会 `request_rebuild` + `initial_dump`）。
-- `tick_size_change` / `new_market` / `market_resolved` 的线上字段名是否与解析别名完全一致。
-- `--max-pages 1 --market-limit 50` 在真实 Gamma keyset 下的实际返回条数（单测 mock discovery，不断网）。
-- 延迟后的真实盘口是否总会在 `snapshot_time >= target_time` 窗口内更新。
-
-需要真人用只读环境跑：
-
-```bash
-python scripts/run_scanner.py --daemon --mode live --paper --max-pages 1 --market-limit 50
-```
-
-确认日志中的 `subscribed_markets=50` 与 WS 订阅成功。
+需要真人只读环境确认：`docker compose --profile paper up` 只有 UI + paper scanner；Observe Only 下 shadow 仍写入 `strategy_*` 表。
 
 ---
 
 ## 仍为模拟的限制
 
-- Paper 成交、P&amp;L、fill、残仓平仓全部是本地盘口模拟，**不能**当作可执行利润。
-- 两腿在真实 CLOB 上不是原子的；模拟在锁内一次记账，等待期间其他任务可以穿插（不持有锁睡眠）。
-- 残仓用成本占用资金，不是逐笔 mark-to-market（marked inventory 目前等于 occupied cost）。
-- Shadow 策略只写 `strategy_*` 表；walk-forward 只输出建议，**不会**改 `live_default` 或 YAML。
-- Snapshot Audit 仍是 REST 瞬时截面，没有 WebSocket 生命周期。
-- 官方 100-token 限制取消后默认一次订阅全部 token；若节点仍拒绝大帧，可把 `ws_subscribe_chunk` 调回正数（仅第一块 `type=market`）。
+- Paper 成交、P&L、残仓平仓全部是本地盘口模拟，不能当作可执行利润。
+- 两腿在真实 CLOB 上不是原子的；模拟在锁内记账，等待期间其他任务可以穿插。
+- Walk-forward 只建议，不会改 `live_default` 或 YAML。
 
-永久只读约束未改：`src/polymarket_scanner/safety.py` `TRADING_ENABLED = False`。
+永久只读：`src/polymarket_scanner/safety.py` `TRADING_ENABLED = False`。

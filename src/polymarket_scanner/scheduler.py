@@ -105,7 +105,7 @@ class ScannerService:
                     signals, scanned_market_ids={market.market_id}
                 )
                 n = persist_signals(market, signals, sims, episode_ids=episode_ids)
-                signals_found += n
+                signals_found += len(n)
 
             status = "ok"
         except Exception as exc:
@@ -184,23 +184,35 @@ class ScannerService:
             started_at=utcnow().isoformat(),
         )
         logger.info("Live Research started paper=%s (read-only)", paper)
+        from zoneinfo import ZoneInfo
+
         from polymarket_scanner.realtime import RealtimeScanner
-        from polymarket_scanner.reporting.html_report import generate_daily_report
+        from polymarket_scanner.reporting.html_report import (
+            generate_daily_report,
+            previous_report_date_due,
+        )
 
         rt = RealtimeScanner(config=self.cfg, paper=paper)
-        # Do not emit an empty report at start — wait for the next UTC date rollover.
-        last_report_date = utcnow().date().isoformat()
+        try:
+            report_tz = ZoneInfo(self.cfg.reporting.timezone or "UTC")
+        except Exception:
+            report_tz = ZoneInfo("UTC")
+        last_report_date = utcnow().astimezone(report_tz).date().isoformat()
 
         async def report_loop() -> None:
             nonlocal last_report_date
             while self._running:
                 if self.cfg.scanner.auto_daily_report:
-                    today = utcnow().date().isoformat()
-                    hour = utcnow().hour
-                    if today != last_report_date and hour >= self.cfg.reporting.report_hour_utc:
+                    due = previous_report_date_due(
+                        now=utcnow(),
+                        last_report_date=last_report_date,
+                        timezone_name=self.cfg.reporting.timezone,
+                        report_hour=self.cfg.reporting.report_hour_utc,
+                    )
+                    if due:
                         try:
-                            generate_daily_report(today)
-                            last_report_date = today
+                            generate_daily_report(due)
+                            last_report_date = utcnow().astimezone(report_tz).date().isoformat()
                         except Exception:
                             logger.exception("Auto daily report failed")
                 await asyncio.sleep(60)
@@ -278,6 +290,7 @@ def get_dashboard_stats() -> dict[str, Any]:
         ) or 0
         lat_rows = session.scalars(
             select(LatencySampleRow.latency_ms)
+            .where(LatencySampleRow.event_type.in_(("price_change", "last_trade_price")))
             .order_by(desc(LatencySampleRow.created_at))
             .limit(500)
         ).all()

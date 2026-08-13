@@ -11,7 +11,6 @@ from sqlalchemy import select
 
 from polymarket_scanner.config import get_config
 from polymarket_scanner.database import (
-    StrategyAccountRow,
     StrategyEvalRow,
     StrategyTradeRow,
     session_scope,
@@ -51,37 +50,6 @@ def compute_trade_metrics(trades: list[StrategyTradeRow]) -> dict[str, Any]:
     }
 
 
-def _account_metrics(row: StrategyAccountRow | None, starting: Decimal, trade_metrics: dict[str, Any]) -> dict[str, Any]:
-    if row is None:
-        cash = starting
-        occupied = ZERO
-        peak = starting
-        max_dd = ZERO
-        realized = _dec(str(trade_metrics["realized_pnl"]))
-    else:
-        cash = _dec(row.cash)
-        occupied = _dec(row.occupied)
-        peak = _dec(row.peak_equity) or starting
-        max_dd = _dec(row.max_drawdown)
-        realized = _dec(row.realized_pnl)
-    equity = cash + occupied
-    utilization = float(occupied / starting) if starting else 0.0
-    out = dict(trade_metrics)
-    out.update(
-        {
-            "realized_pnl": format(realized, "f"),
-            "inventory_adjusted_pnl": format(realized - occupied, "f"),
-            "max_drawdown": format(max_dd, "f"),
-            "capital_utilization": utilization,
-            "cash": format(cash, "f"),
-            "occupied": format(occupied, "f"),
-            "equity": format(equity, "f"),
-            "peak_equity": format(peak, "f"),
-        }
-    )
-    return out
-
-
 def recommend_strategy(metrics_by_key: dict[str, dict[str, Any]], *, min_trades: int) -> tuple[str | None, int | None, bool, str]:
     eligible: list[tuple[str, int, Decimal]] = []
     for key, metrics in metrics_by_key.items():
@@ -113,9 +81,6 @@ def walk_forward_evaluate(
     min_trades = min_trades if min_trades is not None else cfg.scanner.min_walk_forward_trades
     with session_scope() as session:
         trades = session.scalars(select(StrategyTradeRow)).all()
-        accounts = {
-            (r.strategy_id, r.version): r for r in session.scalars(select(StrategyAccountRow)).all()
-        }
         val_by: dict[tuple[str, int], list[StrategyTradeRow]] = {}
         train_by: dict[tuple[str, int], list[StrategyTradeRow]] = {}
         for t in trades:
@@ -131,25 +96,27 @@ def walk_forward_evaluate(
                 val_by.setdefault(key, []).append(t)
 
         metrics: dict[str, dict[str, Any]] = {}
-        starting = cfg.paper.starting_capital
-        keys = set(val_by) | set(train_by) | set(accounts)
+        keys = set(val_by) | set(train_by)
+        train_metrics_by_key: dict[str, dict[str, Any]] = {}
         for sid, ver in keys:
-            val_metrics = compute_trade_metrics(val_by.get((sid, ver), []))
             train_metrics = compute_trade_metrics(train_by.get((sid, ver), []))
-            acct = accounts.get((sid, ver))
-            combined = _account_metrics(acct, starting, val_metrics)
+            val_metrics = compute_trade_metrics(val_by.get((sid, ver), []))
+            sk = f"{sid}@{ver}"
+            train_metrics_by_key[sk] = train_metrics
+            combined = dict(val_metrics)
             combined["training"] = train_metrics
+            combined["validation"] = val_metrics
             combined["validation_trade_count"] = val_metrics["trade_count"]
-            metrics[f"{sid}@{ver}"] = combined
+            combined["used_account_overlay"] = False
+            metrics[sk] = combined
 
-        val_only = {
-            k: {
-                **v,
-                "trade_count": v.get("validation_trade_count") or v.get("trade_count") or 0,
-            }
-            for k, v in metrics.items()
-        }
-        rec_id, rec_ver, insufficient, note = recommend_strategy(val_only, min_trades=min_trades)
+        rec_id, rec_ver, insufficient, note = recommend_strategy(
+            train_metrics_by_key, min_trades=min_trades
+        )
+        if rec_id is not None:
+            rec_key = f"{rec_id}@{rec_ver}"
+            for sk, combined in metrics.items():
+                combined["selected_in_training"] = sk == rec_key
         sample = sum(int(v.get("validation_trade_count") or 0) for v in metrics.values())
         row = StrategyEvalRow(
             training_start=training_start,

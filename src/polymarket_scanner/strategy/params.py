@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -62,3 +63,18 @@ def params_from_json(raw: str | dict[str, object]) -> StrategyParams:
 
 def params_to_json(params: StrategyParams) -> str:
     return params.model_dump_json()
+
+
+def strategy_eligible(params: StrategyParams, signal: Any) -> bool:
+    """Per-strategy gate on a raw forward episode. Independent of live Balanced rules."""
+    if signal.direction.value != "forward":
+        return False
+    if signal.net_profit <= 0 or signal.stale or signal.books_skewed or not signal.books_ready:
+        return False
+    if params.min_net_profit > 0 and signal.net_profit < params.min_net_profit:
+        return False
+    if params.min_profit_per_share > 0 and signal.net_profit_per_share < params.min_profit_per_share:
+        return False
+    if params.minimum_quantity > 0 and signal.quantity < params.minimum_quantity:
+        return False
+    return True

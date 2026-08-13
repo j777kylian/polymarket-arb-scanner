@@ -452,6 +452,57 @@ class PaperTradeRow(Base):
     book_skew_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     expected_net_profit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    leg_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    first_qty: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_qty: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    first_vwap: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_vwap: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    first_fee: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_fee: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    signal_to_first_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    first_to_second_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class PositionRow(Base):
+    __tablename__ = "positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    market_id: Mapped[str] = mapped_column(String(64), index=True)
+    token_id: Mapped[str] = mapped_column(String(128), index=True)
+    outcome: Mapped[str] = mapped_column(String(16))
+    quantity: Mapped[str] = mapped_column(String(32), default="0")
+    cost_basis: Mapped[str] = mapped_column(String(32), default="0")
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_mark_price: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    marked_value: Mapped[str] = mapped_column(String(32), default="0")
+    unrealized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class StrategyPositionRow(Base):
+    __tablename__ = "strategy_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[int] = mapped_column(Integer)
+    market_id: Mapped[str] = mapped_column(String(64), index=True)
+    token_id: Mapped[str] = mapped_column(String(128), index=True)
+    outcome: Mapped[str] = mapped_column(String(16))
+    quantity: Mapped[str] = mapped_column(String(32), default="0")
+    cost_basis: Mapped[str] = mapped_column(String(32), default="0")
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_mark_price: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    marked_value: Mapped[str] = mapped_column(String(32), default="0")
+    unrealized_pnl: Mapped[str] = mapped_column(String(32), default="0")
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    episode_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class StrategyConfigRow(Base):
@@ -493,6 +544,7 @@ class StrategyAccountRow(Base):
     realized_pnl: Mapped[str] = mapped_column(String(32), default="0")
     peak_equity: Mapped[str] = mapped_column(String(32), default="1000")
     max_drawdown: Mapped[str] = mapped_column(String(32), default="0")
+    marked_inventory: Mapped[str] = mapped_column(String(32), default="0")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -512,6 +564,20 @@ class StrategyTradeRow(Base):
     cash_after: Mapped[str] = mapped_column(String(32), default="0")
     remaining_inventory: Mapped[str] = mapped_column(String(32), default="0")
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_leg_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    second_leg_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_qty: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_qty: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    first_vwap: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_vwap: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    first_fee: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    second_fee: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    t0_book_hashes: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    execution_book_hashes: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    signal_to_first_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    first_to_second_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    signal_opportunity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class StrategyEvalRow(Base):
@@ -670,6 +736,30 @@ def _ensure_schema(engine) -> None:
         ("paper_trades", "book_skew_ms", "FLOAT"),
         ("paper_trades", "expected_net_profit", "VARCHAR(32)"),
         ("paper_trades", "realized_pnl", "VARCHAR(32) DEFAULT '0'"),
+        ("paper_trades", "leg_state", "VARCHAR(32)"),
+        ("paper_trades", "first_qty", "VARCHAR(32)"),
+        ("paper_trades", "second_qty", "VARCHAR(32)"),
+        ("paper_trades", "first_vwap", "VARCHAR(32)"),
+        ("paper_trades", "second_vwap", "VARCHAR(32)"),
+        ("paper_trades", "first_fee", "VARCHAR(32)"),
+        ("paper_trades", "second_fee", "VARCHAR(32)"),
+        ("paper_trades", "signal_to_first_ms", "FLOAT"),
+        ("paper_trades", "first_to_second_ms", "FLOAT"),
+        ("strategy_accounts", "marked_inventory", "VARCHAR(32) DEFAULT '0'"),
+        ("strategy_trades", "first_leg_time", "DATETIME"),
+        ("strategy_trades", "second_leg_time", "DATETIME"),
+        ("strategy_trades", "close_time", "DATETIME"),
+        ("strategy_trades", "first_qty", "VARCHAR(32)"),
+        ("strategy_trades", "second_qty", "VARCHAR(32)"),
+        ("strategy_trades", "first_vwap", "VARCHAR(32)"),
+        ("strategy_trades", "second_vwap", "VARCHAR(32)"),
+        ("strategy_trades", "first_fee", "VARCHAR(32)"),
+        ("strategy_trades", "second_fee", "VARCHAR(32)"),
+        ("strategy_trades", "t0_book_hashes", "VARCHAR(256)"),
+        ("strategy_trades", "execution_book_hashes", "VARCHAR(256)"),
+        ("strategy_trades", "signal_to_first_ms", "FLOAT"),
+        ("strategy_trades", "first_to_second_ms", "FLOAT"),
+        ("strategy_trades", "signal_opportunity_id", "INTEGER"),
     ]
     with engine.begin() as conn:
         for table, column, ddl in specs:

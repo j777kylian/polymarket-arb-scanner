@@ -52,6 +52,7 @@ class ScannerConfig(BaseModel):
     sync_markets: bool = True
     ws_persist_min_interval_ms: int = 400
     min_walk_forward_trades: int = 30
+    new_market_resync_cooldown_seconds: int = 30
 
 
 class PaperConfig(BaseModel):

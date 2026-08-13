@@ -6,8 +6,14 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 
-from polymarket_scanner.database import StrategyAccountRow, StrategyConfigRow, session_scope
-from polymarket_scanner.strategy.params import StrategyParams, params_from_json
+from polymarket_scanner.database import (
+    StrategyAccountRow,
+    StrategyConfigRow,
+    StrategyRunRow,
+    session_scope,
+    utcnow,
+)
+from polymarket_scanner.strategy.params import StrategyParams, params_from_json, params_to_json
 
 
 @dataclass(frozen=True)
@@ -73,3 +79,79 @@ def _to_loaded(row: StrategyConfigRow) -> LoadedStrategy:
         is_live=row.is_live,
         params=params_from_json(row.params_json),
     )
+
+
+def list_strategy_configs() -> list[StrategyConfigRow]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(StrategyConfigRow).order_by(StrategyConfigRow.strategy_id, StrategyConfigRow.version)
+        ).all()
+        session.expunge_all()
+        return list(rows)
+
+
+def set_strategy_enabled(strategy_id: str, version: int, enabled: bool) -> None:
+    with session_scope() as session:
+        row = session.scalar(
+            select(StrategyConfigRow).where(
+                StrategyConfigRow.strategy_id == strategy_id,
+                StrategyConfigRow.version == version,
+            )
+        )
+        if row is not None:
+            row.enabled = enabled
+
+
+def create_strategy_version(
+    strategy_id: str,
+    name: str,
+    params: StrategyParams,
+    *,
+    is_live: bool = False,
+    enabled: bool = True,
+) -> int:
+    """Insert a new immutable version. Never UPDATE params_json."""
+    with session_scope() as session:
+        current = session.scalars(
+            select(StrategyConfigRow)
+            .where(StrategyConfigRow.strategy_id == strategy_id)
+            .order_by(StrategyConfigRow.version.desc())
+        ).first()
+        version = (current.version + 1) if current is not None else 1
+        session.add(
+            StrategyConfigRow(
+                strategy_id=strategy_id,
+                version=version,
+                name=name,
+                enabled=enabled,
+                is_live=is_live,
+                params_json=params_to_json(params),
+            )
+        )
+    ensure_strategy_account(strategy_id, version, str(params.starting_capital))
+    return version
+
+
+def start_strategy_runs() -> list[int]:
+    ids: list[int] = []
+    with session_scope() as session:
+        rows = session.scalars(select(StrategyConfigRow).where(StrategyConfigRow.enabled.is_(True))).all()
+        for row in rows:
+            run = StrategyRunRow(
+                strategy_id=row.strategy_id,
+                strategy_version=row.version,
+                status="running",
+            )
+            session.add(run)
+            session.flush()
+            ids.append(int(run.id))
+    return ids
+
+
+def finish_open_strategy_runs() -> None:
+    with session_scope() as session:
+        rows = session.scalars(select(StrategyRunRow).where(StrategyRunRow.status == "running")).all()
+        now = utcnow()
+        for row in rows:
+            row.finished_at = now
+            row.status = "stopped"

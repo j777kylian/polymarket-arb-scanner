@@ -18,6 +18,7 @@ services:
 
   scanner:
     build: .
+    profiles: ["observe"]
     command: ["python", "scripts/run_scanner.py", "--daemon", "--mode", "live"]
     environment:
       - DATABASE_URL=sqlite:///./data/scanner.db

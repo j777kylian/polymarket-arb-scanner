@@ -214,6 +214,7 @@ class OpportunitySignal(BaseModel):
     book_skew_ms: float | None = None
     books_skewed: bool = False
     passes_rule_set: bool | None = None
+    opportunity_id: int | None = None
 
 
 class SimulationLegResult(BaseModel):

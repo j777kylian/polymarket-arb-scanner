@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from jinja2 import Template
 from sqlalchemy import desc, select
@@ -133,10 +134,38 @@ HTML_TEMPLATE = Template(
 )
 
 
+def _report_tz() -> ZoneInfo:
+    name = get_config().reporting.timezone or "UTC"
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
 def _day_bounds(report_date: str) -> tuple[datetime, datetime]:
-    start = datetime.fromisoformat(report_date).replace(tzinfo=timezone.utc)
-    end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
-    return start, end
+    tz = _report_tz()
+    start_local = datetime.fromisoformat(report_date).replace(tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def previous_report_date_due(
+    *,
+    now: datetime,
+    last_report_date: str,
+    timezone_name: str,
+    report_hour: int,
+) -> str | None:
+    """If local date rolled past last_report_date, return that previous date to generate."""
+    try:
+        tz = ZoneInfo(timezone_name or "UTC")
+    except Exception:
+        tz = ZoneInfo("UTC")
+    local = now.astimezone(tz) if now.tzinfo else now.replace(tzinfo=tz)
+    today = local.date().isoformat()
+    if today != last_report_date and local.hour >= int(report_hour):
+        return last_report_date
+    return None
 
 
 def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
@@ -150,7 +179,7 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         ops = session.scalars(
             select(OpportunityRow).where(
                 OpportunityRow.discovered_at >= start,
-                OpportunityRow.discovered_at <= end,
+                OpportunityRow.discovered_at < end,
             )
         ).all()
 
@@ -176,7 +205,7 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         api_errors = len(
             session.scalars(
                 select(ApiErrorRow).where(
-                    ApiErrorRow.created_at >= start, ApiErrorRow.created_at <= end
+                    ApiErrorRow.created_at >= start, ApiErrorRow.created_at < end
                 )
             ).all()
         )
@@ -201,7 +230,7 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
         day_trades = session.scalars(
             select(PaperTradeRow).where(
                 PaperTradeRow.created_at >= start,
-                PaperTradeRow.created_at <= end,
+                PaperTradeRow.created_at < end,
             )
         ).all()
         daily_pnl = sum(
@@ -213,7 +242,7 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             session.scalars(
                 select(OpportunityEpisodeRow).where(
                     OpportunityEpisodeRow.first_seen_at >= start,
-                    OpportunityEpisodeRow.first_seen_at <= end,
+                    OpportunityEpisodeRow.first_seen_at < end,
                 )
             ).all()
         )
@@ -361,4 +390,9 @@ def generate_daily_report(report_date: str | None = None) -> dict[str, Any]:
             session.add(DailyReportRow(report_date=report_date, **fields))
 
     logger.info("Generated daily report %s", report_date)
-    return {"report_date": report_date, "html": str(html_path), "csv": str(csv_path)}
+    return {
+        "report_date": report_date,
+        "html": str(html_path),
+        "csv": str(csv_path),
+        "daily_realized_pnl": paper_pnl,
+    }

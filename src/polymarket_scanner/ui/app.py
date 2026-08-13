@@ -85,6 +85,7 @@ PAGES = [
     "Opportunities",
     "Simulator",
     "Paper",
+    "Strategies",
     "Rules",
     "Reports",
     "Settings",
@@ -632,13 +633,19 @@ def page_paper() -> None:
         "On a new episode the engine waits 500ms, then FOK/FAK-fills YES then NO, "
         "merges matched complete sets at $1, and recycles cash."
     )
+    from polymarket_scanner.database import PositionRow
     from polymarket_scanner.simulation.paper_trader import get_paper_account
 
     cash, occupied, pnl = get_paper_account()
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash (paper)", f"{float(cash):.4f}")
-    c2.metric("Occupied", f"{float(occupied):.4f}")
+    c2.metric("Cost basis (occupied)", f"{float(occupied):.4f}")
     c3.metric("Realized PnL", f"{float(pnl):.4f}")
+    with session_scope() as session:
+        pos = session.scalars(select(PositionRow).where(PositionRow.status.in_(["open", "RESIDUAL_OPEN", "residual_open"]))).all()
+        marked = sum((Decimal(p.marked_value or "0") for p in pos), Decimal("0"))
+    c4.metric("Marked value", f"{float(marked):.4f}")
+    st.caption("Equity = cash + marked value. Occupied cost is not market value.")
 
     st.subheader("Opportunity episodes")
     with session_scope() as session:
@@ -686,6 +693,188 @@ def page_paper() -> None:
     st.dataframe(pd.DataFrame(ep_rows), use_container_width=True)
     st.subheader("Paper fills")
     st.dataframe(pd.DataFrame(t_rows), use_container_width=True)
+    st.subheader("Open positions")
+    with session_scope() as session:
+        from polymarket_scanner.database import PositionRow
+
+        pos = session.scalars(select(PositionRow).order_by(desc(PositionRow.acquired_at)).limit(200)).all()
+        p_rows = [
+            {
+                "market_id": p.market_id,
+                "token_id": p.token_id,
+                "outcome": p.outcome,
+                "qty": p.quantity,
+                "cost_basis": p.cost_basis,
+                "mark": p.last_mark_price,
+                "marked_value": p.marked_value,
+                "unrealized": p.unrealized_pnl,
+                "status": p.status,
+            }
+            for p in pos
+        ]
+    st.dataframe(pd.DataFrame(p_rows), use_container_width=True)
+
+
+def page_strategies() -> None:
+    st.title("Strategies")
+    st.caption(
+        "Immutable versions — creating a version inserts a new row. "
+        "Walk-forward recommends only; it never auto-applies live params. Paper-only."
+    )
+    from polymarket_scanner.database import (
+        StrategyAccountRow,
+        StrategyEvalRow,
+        StrategyPositionRow,
+        StrategyRunRow,
+        StrategyTradeRow,
+    )
+    from polymarket_scanner.strategy.params import params_from_json
+    from polymarket_scanner.strategy.store import (
+        create_strategy_version,
+        list_strategy_configs,
+        set_strategy_enabled,
+    )
+
+    rows = list_strategy_configs()
+    if not rows:
+        st.info("No strategies seeded yet. Restart scanner / init_db.")
+        return
+    labels = [f"{r.strategy_id} v{r.version} ({'live' if r.is_live else 'shadow'})" for r in rows]
+    idx = st.selectbox("Strategy version", range(len(labels)), format_func=lambda i: labels[i])
+    current = rows[idx]
+    params = params_from_json(current.params_json)
+    st.write(f"Enabled: {current.enabled} · live={current.is_live}")
+    st.json(params.model_dump(mode="json"))
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Enable"):
+        set_strategy_enabled(current.strategy_id, current.version, True)
+        st.rerun()
+    if c2.button("Disable"):
+        set_strategy_enabled(current.strategy_id, current.version, False)
+        st.rerun()
+    with st.expander("Create new version (does not mutate this version)"):
+        delay = st.number_input("delay_ms", value=int(params.delay_ms))
+        min_net = st.text_input("min_net_profit", value=str(params.min_net_profit))
+        tif = st.selectbox("tif", ["FAK", "FOK"], index=0 if params.tif == "FAK" else 1)
+        if st.button("Insert new version"):
+            new_p = params.model_copy(
+                update={"delay_ms": int(delay), "min_net_profit": Decimal(min_net), "tif": tif}
+            )
+            ver = create_strategy_version(
+                current.strategy_id, current.name, new_p, is_live=current.is_live, enabled=True
+            )
+            st.success(f"Created {current.strategy_id} v{ver}")
+            st.rerun()
+
+    with session_scope() as session:
+        acct = session.scalar(
+            select(StrategyAccountRow).where(
+                StrategyAccountRow.strategy_id == current.strategy_id,
+                StrategyAccountRow.version == current.version,
+            )
+        )
+        trades = session.scalars(
+            select(StrategyTradeRow)
+            .where(
+                StrategyTradeRow.strategy_id == current.strategy_id,
+                StrategyTradeRow.strategy_version == current.version,
+            )
+            .order_by(desc(StrategyTradeRow.created_at))
+            .limit(100)
+        ).all()
+        pos = session.scalars(
+            select(StrategyPositionRow).where(
+                StrategyPositionRow.strategy_id == current.strategy_id,
+                StrategyPositionRow.strategy_version == current.version,
+            )
+        ).all()
+        runs = session.scalars(
+            select(StrategyRunRow)
+            .where(StrategyRunRow.strategy_id == current.strategy_id)
+            .order_by(desc(StrategyRunRow.started_at))
+            .limit(20)
+        ).all()
+        evals = session.scalars(select(StrategyEvalRow).order_by(desc(StrategyEvalRow.id)).limit(10)).all()
+    if acct:
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Cash", acct.cash)
+        a2.metric("Cost basis", acct.occupied)
+        a3.metric("Marked inventory", acct.marked_inventory)
+        a4.metric("Realized P&L", acct.realized_pnl)
+        st.caption("Equity = cash + marked inventory, not occupied cost.")
+    st.subheader("Runs")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "id": r.id,
+                    "version": r.strategy_version,
+                    "started": r.started_at,
+                    "finished": r.finished_at,
+                    "status": r.status,
+                    "trades": r.trade_count,
+                }
+                for r in runs
+            ]
+        ),
+        use_container_width=True,
+    )
+    st.subheader("Trades")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "created": t.created_at,
+                    "status": t.status,
+                    "pnl": t.realized_pnl,
+                    "first_qty": t.first_qty,
+                    "second_qty": t.second_qty,
+                    "first_vwap": t.first_vwap,
+                    "second_vwap": t.second_vwap,
+                    "signal_to_first_ms": t.signal_to_first_ms,
+                    "first_to_second_ms": t.first_to_second_ms,
+                    "opp_id": t.signal_opportunity_id,
+                    "cash_after": t.cash_after,
+                }
+                for t in trades
+            ]
+        ),
+        use_container_width=True,
+    )
+    st.subheader("Positions")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "market_id": p.market_id,
+                    "outcome": p.outcome,
+                    "qty": p.quantity,
+                    "cost_basis": p.cost_basis,
+                    "marked_value": p.marked_value,
+                    "unrealized": p.unrealized_pnl,
+                    "status": p.status,
+                }
+                for p in pos
+            ]
+        ),
+        use_container_width=True,
+    )
+    st.subheader("Walk-forward")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "id": e.id,
+                    "insufficient": e.insufficient_sample,
+                    "recommended": e.recommended_strategy_id,
+                    "version": e.recommended_version,
+                    "note": e.note,
+                }
+                for e in evals
+            ]
+        ),
+        use_container_width=True,
+    )
 
 
 def page_rules() -> None:
@@ -843,6 +1032,7 @@ def page_settings() -> None:
     max_age = st.number_input("Max data age (s)", value=cfg.scanner.max_data_age_seconds)
     retention = st.number_input("Retention days", value=cfg.scanner.retention_days)
     tz = st.text_input("Timezone", value=cfg.reporting.timezone)
+    st.caption("Used for daily-report date bounds and auto-report rollover (not display-only).")
     log_level = st.selectbox("Log level", ["DEBUG", "INFO", "WARNING", "ERROR"], index=1)
     st.text_input("Database path", value=cfg.database.url, disabled=True)
     if st.button("Save settings"):
@@ -869,6 +1059,8 @@ elif page == "Simulator":
     page_simulator()
 elif page == "Paper":
     page_paper()
+elif page == "Strategies":
+    page_strategies()
 elif page == "Rules":
     page_rules()
 elif page == "Reports":

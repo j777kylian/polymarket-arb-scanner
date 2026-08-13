@@ -234,8 +234,15 @@ def test_skewed_not_net_profitable(tmp_path, monkeypatch) -> None:
 
 def test_latency_batches_until_flush(tmp_path, monkeypatch) -> None:
     dbmod, get_config = _db(tmp_path, monkeypatch)
-    from polymarket_scanner.database import LatencySampleRow
+    from sqlalchemy import delete
 
+    from polymarket_scanner.database import LatencySampleRow
+    from polymarket_scanner.scanners import pipeline as pipeline_mod
+
+    with pipeline_mod._latency_lock:
+        pipeline_mod._latency_buf.clear()
+    with session_scope() as session:
+        session.execute(delete(LatencySampleRow))
     record_latency("book", 12.0, token_id="t")
     with session_scope() as session:
         n = session.scalar(select(func.count()).select_from(LatencySampleRow))

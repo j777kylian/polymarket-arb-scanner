@@ -10,6 +10,7 @@ from typing import Any
 from polymarket_scanner.config import get_config
 from polymarket_scanner.database import (
     LatencySampleRow,
+    OpportunityEpisodeRow,
     OpportunityRow,
     decimal_to_str,
     session_scope,
@@ -48,17 +49,21 @@ def _signal_rule_obj(sig: OpportunitySignal, sims: dict[str, Any]) -> dict[str, 
     }
 
 
+FEED_LATENCY_EVENTS = {"price_change", "last_trade_price", "tick_size_change"}
+SNAPSHOT_LATENCY_EVENTS = {"book", "market_book", "initial_snapshot_age"}
+
+
 def persist_signals(
     market: MarketInfo,
     signals: list[OpportunitySignal],
     sims: dict[str, Any],
     *,
     episode_ids: dict[tuple[str, str], int] | None = None,
-) -> int:
+) -> list[int]:
     if not signals:
-        return 0
+        return []
     rule_set, rule_id, rule_ver = get_enabled_rule_set_meta(get_config().scanner.default_rule_set)
-    count = 0
+    ids: list[int] = []
     with session_scope() as session:
         for sig in signals:
             opt = sims.get("optimistic")
@@ -77,48 +82,53 @@ def persist_signals(
                 and not sig.books_skewed
                 and sig.books_ready
             )
-            session.add(
-                OpportunityRow(
-                    market_id=sig.market_id,
-                    condition_id=sig.condition_id,
-                    question=sig.question,
-                    direction=sig.direction.value,
-                    discovered_at=sig.discovered_at,
-                    data_age_seconds=sig.data_age_seconds,
-                    stale=sig.stale,
-                    quantity=decimal_to_str(sig.quantity) or "0",
-                    yes_vwap=decimal_to_str(sig.yes_vwap) or "0",
-                    no_vwap=decimal_to_str(sig.no_vwap) or "0",
-                    gross_profit=decimal_to_str(sig.gross_profit) or "0",
-                    fee_total=decimal_to_str(sig.fee_total) or "0",
-                    net_profit=decimal_to_str(sig.net_profit) or "0",
-                    net_profit_per_share=decimal_to_str(sig.net_profit_per_share) or "0",
-                    net_profit_rate=decimal_to_str(sig.net_profit_rate) or "0",
-                    levels_used_yes=sig.levels_used_yes,
-                    levels_used_no=sig.levels_used_no,
-                    fees_enabled=sig.fees_enabled,
-                    neg_risk=sig.neg_risk,
-                    risk_tags_json=json.dumps(sig.risk_tags),
-                    requires_split_inventory=sig.requires_split_inventory,
-                    net_profitable=net_ok,
-                    optimistic_net=decimal_to_str(opt.net_profit) if opt else None,
-                    base_net=decimal_to_str(base.net_profit) if base else None,
-                    pessimistic_net=decimal_to_str(pes.net_profit) if pes else None,
-                    simulation_quality=base.quality.value if base else None,
-                    optimistic_quality=opt.quality.value if opt else None,
-                    base_quality=base.quality.value if base else None,
-                    pessimistic_quality=pes.quality.value if pes else None,
-                    payload_json=sig.model_dump_json(),
-                    episode_id=ep_id,
-                    passes_rule_set=passes,
-                    rule_set_id=rule_id,
-                    rule_set_version=rule_ver,
-                    books_ready=sig.books_ready,
-                    book_skew_ms=sig.book_skew_ms,
-                )
+            row = OpportunityRow(
+                market_id=sig.market_id,
+                condition_id=sig.condition_id,
+                question=sig.question,
+                direction=sig.direction.value,
+                discovered_at=sig.discovered_at,
+                data_age_seconds=sig.data_age_seconds,
+                stale=sig.stale,
+                quantity=decimal_to_str(sig.quantity) or "0",
+                yes_vwap=decimal_to_str(sig.yes_vwap) or "0",
+                no_vwap=decimal_to_str(sig.no_vwap) or "0",
+                gross_profit=decimal_to_str(sig.gross_profit) or "0",
+                fee_total=decimal_to_str(sig.fee_total) or "0",
+                net_profit=decimal_to_str(sig.net_profit) or "0",
+                net_profit_per_share=decimal_to_str(sig.net_profit_per_share) or "0",
+                net_profit_rate=decimal_to_str(sig.net_profit_rate) or "0",
+                levels_used_yes=sig.levels_used_yes,
+                levels_used_no=sig.levels_used_no,
+                fees_enabled=sig.fees_enabled,
+                neg_risk=sig.neg_risk,
+                risk_tags_json=json.dumps(sig.risk_tags),
+                requires_split_inventory=sig.requires_split_inventory,
+                net_profitable=net_ok,
+                optimistic_net=decimal_to_str(opt.net_profit) if opt else None,
+                base_net=decimal_to_str(base.net_profit) if base else None,
+                pessimistic_net=decimal_to_str(pes.net_profit) if pes else None,
+                simulation_quality=base.quality.value if base else None,
+                optimistic_quality=opt.quality.value if opt else None,
+                base_quality=base.quality.value if base else None,
+                pessimistic_quality=pes.quality.value if pes else None,
+                payload_json=sig.model_dump_json(),
+                episode_id=ep_id,
+                passes_rule_set=passes,
+                rule_set_id=rule_id,
+                rule_set_version=rule_ver,
+                books_ready=sig.books_ready,
+                book_skew_ms=sig.book_skew_ms,
             )
-            count += 1
-    return count
+            session.add(row)
+            session.flush()
+            sig.opportunity_id = int(row.id)
+            ids.append(int(row.id))
+            if ep_id is not None:
+                ep = session.get(OpportunityEpisodeRow, ep_id)
+                if ep is not None:
+                    ep.last_opportunity_id = int(row.id)
+    return ids
 
 
 def scan_and_persist_market(

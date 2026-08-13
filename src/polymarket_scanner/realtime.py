@@ -21,9 +21,17 @@ from polymarket_scanner.scanners.binary_complete_set import scan_binary_market
 from polymarket_scanner.scanners.opportunity_tracker import close_episodes, sync_episodes
 from polymarket_scanner.scanners.pipeline import flush_latency, persist_signals, record_latency
 from polymarket_scanner.simulation.execution_simulator import simulate_all_profiles
+from polymarket_scanner.simulation.inventory import (
+    process_residuals_with_books,
+    settle_market_resolved,
+)
 from polymarket_scanner.simulation.paper_trader import run_delayed_paper_trade
 from polymarket_scanner.strategy.shadow import run_shadow_paper
-from polymarket_scanner.strategy.store import load_enabled_shadow_strategies
+from polymarket_scanner.strategy.store import (
+    finish_open_strategy_runs,
+    load_enabled_shadow_strategies,
+    start_strategy_runs,
+)
 
 logger = get_logger(__name__)
 
@@ -37,14 +45,20 @@ class RealtimeScanner:
         self.markets: dict[str, MarketInfo] = {}
         self.token_to_market: dict[str, str] = {}
         self.token_outcome: dict[str, OutcomeSide] = {}
+        self.condition_to_market_id: dict[str, str] = {}
         self._dirty: set[str] = set()
         self._papered_episodes: set[int] = set()
+        self._shadow_attempted: set[tuple[str, int, int]] = set()
+        self._shadow_eligible: dict[tuple[str, int, int], bool] = {}
         self._paper_tasks: set[asyncio.Task[Any]] = set()
         self.ws: MarketWebsocketClient | None = None
         self.last_recalc_at: datetime | None = None
         self._last_persist: dict[str, datetime] = {}
         self._running = False
         self._need_market_sync = False
+        self._connect_mono: float = 0.0
+        self._last_new_market_flag: float = 0.0
+        self._last_ws_received: datetime | None = None
         self.run_id: int | None = None
         self.discovered_markets = 0
 
@@ -54,6 +68,7 @@ class RealtimeScanner:
         self.markets = {}
         self.token_to_market = {}
         self.token_outcome = {}
+        self.condition_to_market_id = {}
         for m in markets:
             if not m.yes_token_id or not m.no_token_id:
                 continue
@@ -62,6 +77,8 @@ class RealtimeScanner:
             self.token_to_market[m.no_token_id] = m.market_id
             self.token_outcome[m.yes_token_id] = OutcomeSide.YES
             self.token_outcome[m.no_token_id] = OutcomeSide.NO
+            if m.condition_id:
+                self.condition_to_market_id[m.condition_id] = m.market_id
         new_tokens = set(self.token_to_market.keys())
         added, removed = diff_tokens(old_tokens, new_tokens)
         removed_markets = old_markets - set(self.markets.keys())
@@ -102,6 +119,10 @@ class RealtimeScanner:
 
     async def _on_connect(self, generation: int) -> None:
         self.cache.begin_generation()
+        try:
+            self._connect_mono = asyncio.get_event_loop().time()
+        except Exception:
+            self._connect_mono = 0.0
         logger.info("WS generation %s — books marked not-ready until snapshots", generation)
 
     async def _on_disconnect(self) -> None:
@@ -129,11 +150,14 @@ class RealtimeScanner:
         mid = str(payload.get("market") or payload.get("market_id") or payload.get("condition_id") or "")
         if mid and mid in self.markets:
             return mid
+        if mid and mid in self.condition_to_market_id:
+            return self.condition_to_market_id[mid]
         if token_id:
             return self.token_to_market.get(token_id)
         return None
 
     async def _on_ws(self, event: dict[str, Any], received: datetime) -> None:
+        self._last_ws_received = received
         event_type = str(event.get("event_type") or event.get("type") or "")
         raw_payload = event.get("payload")
         payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else event
@@ -141,13 +165,28 @@ class RealtimeScanner:
         if ts is not None:
             latency_ms = max(0.0, (received - ts).total_seconds() * 1000.0)
             if latency_ms < 60_000:
-                record_latency(
-                    event_type or "unknown",
-                    latency_ms,
-                    token_id=str(payload.get("asset_id") or payload.get("tokenId") or "") or None,
-                    event_ts=ts,
-                    received_at=received,
+                from polymarket_scanner.scanners.pipeline import (
+                    FEED_LATENCY_EVENTS,
+                    SNAPSHOT_LATENCY_EVENTS,
                 )
+
+                sample_type = event_type or "unknown"
+                if sample_type in SNAPSHOT_LATENCY_EVENTS or sample_type in {"book", "market_book"}:
+                    record_latency(
+                        "initial_snapshot_age",
+                        latency_ms,
+                        token_id=str(payload.get("asset_id") or payload.get("tokenId") or "") or None,
+                        event_ts=ts,
+                        received_at=received,
+                    )
+                elif sample_type in FEED_LATENCY_EVENTS or sample_type == "price_change":
+                    record_latency(
+                        sample_type,
+                        latency_ms,
+                        token_id=str(payload.get("asset_id") or payload.get("tokenId") or "") or None,
+                        event_ts=ts,
+                        received_at=received,
+                    )
 
         if event_type in {"book", "market_book"}:
             token_id = str(payload.get("asset_id") or payload.get("tokenId") or "")
@@ -208,7 +247,17 @@ class RealtimeScanner:
             return
 
         if event_type == "new_market":
+            try:
+                now_m = asyncio.get_event_loop().time()
+            except Exception:
+                now_m = 0.0
+            cooldown = float(self.cfg.scanner.new_market_resync_cooldown_seconds)
+            if self._connect_mono and now_m - self._connect_mono < cooldown:
+                return
+            if self._last_new_market_flag and now_m - self._last_new_market_flag < cooldown:
+                return
             self._need_market_sync = True
+            self._last_new_market_flag = now_m
             return
 
         if event_type in {"market_resolved", "market_removed"}:
@@ -222,6 +271,17 @@ class RealtimeScanner:
                 if market and market.no_token_id:
                     self.token_to_market.pop(market.no_token_id, None)
                     self.token_outcome.pop(market.no_token_id, None)
+                if market and market.condition_id:
+                    self.condition_to_market_id.pop(market.condition_id, None)
+                settle_market_resolved(
+                    mid,
+                    winning_asset_id=str(payload.get("winning_asset_id") or payload.get("winningAssetId") or "")
+                    or None,
+                    winning_outcome=str(payload.get("winning_outcome") or payload.get("winningOutcome") or "")
+                    or None,
+                    yes_token_id=market.yes_token_id if market else None,
+                    no_token_id=market.no_token_id if market else None,
+                )
                 if self.ws:
                     await self.ws.update_subscriptions(list(self.token_to_market.keys()))
             return
@@ -244,21 +304,26 @@ class RealtimeScanner:
         )
         self._paper_tasks.add(task)
         task.add_done_callback(self._paper_tasks.discard)
-        for shadow in load_enabled_shadow_strategies():
-            stask = asyncio.create_task(
-                run_shadow_paper(
-                    shadow,
-                    cache=self.cache,
-                    market=market,
-                    signal=sig,
-                    episode_id=episode_id,
-                    base_cfg=self.cfg,
-                    t0_yes=t0_yes,
-                    t0_no=t0_no,
-                )
+
+    def _spawn_shadow(
+        self, strategy: Any, market: MarketInfo, sig: OpportunitySignal, episode_id: int
+    ) -> None:
+        t0_yes = self.cache.get(market.yes_token_id or "")
+        t0_no = self.cache.get(market.no_token_id or "")
+        stask = asyncio.create_task(
+            run_shadow_paper(
+                strategy,
+                cache=self.cache,
+                market=market,
+                signal=sig,
+                episode_id=episode_id,
+                base_cfg=self.cfg,
+                t0_yes=t0_yes,
+                t0_no=t0_no,
             )
-            self._paper_tasks.add(stask)
-            stask.add_done_callback(self._paper_tasks.discard)
+        )
+        self._paper_tasks.add(stask)
+        stask.add_done_callback(self._paper_tasks.discard)
 
     def _recalc_dirty(self) -> list[OpportunitySignal]:
         dirty = list(self._dirty)
@@ -288,12 +353,21 @@ class RealtimeScanner:
             episode_ids, stats = sync_episodes(signals, scanned_market_ids={market_id})
             persist_signals(market, signals, sims, episode_ids=episode_ids)
             all_signals.extend(signals)
-            if self.paper and stats.get("opened"):
-                for sig in signals:
-                    if sig.direction.value != "forward" or sig.net_profit <= 0:
-                        continue
-                    if sig.stale or sig.books_skewed or not sig.books_ready:
-                        continue
+            process_residuals_with_books(market_id, yes_book, no_book)
+            if self._last_ws_received is not None:
+                rec_ms = (now - self._last_ws_received).total_seconds() * 1000.0
+                record_latency("receive_to_recalc", rec_ms, received_at=now)
+            raw_forwards = [
+                s
+                for s in signals
+                if s.direction.value == "forward"
+                and s.net_profit > 0
+                and not s.stale
+                and not s.books_skewed
+                and s.books_ready
+            ]
+            if self.paper:
+                for sig in raw_forwards:
                     if sig.passes_rule_set is False:
                         continue
                     ep = episode_ids.get((sig.market_id, sig.direction.value))
@@ -301,6 +375,20 @@ class RealtimeScanner:
                         continue
                     self._papered_episodes.add(ep)
                     self._spawn_paper(market, sig, ep)
+            from polymarket_scanner.strategy.params import strategy_eligible
+
+            for shadow in load_enabled_shadow_strategies():
+                for sig in raw_forwards:
+                    ep = episode_ids.get((sig.market_id, sig.direction.value))
+                    if ep is None:
+                        continue
+                    key = (shadow.strategy_id, shadow.version, ep)
+                    eligible = strategy_eligible(shadow.params, sig)
+                    was = self._shadow_eligible.get(key, False)
+                    self._shadow_eligible[key] = eligible
+                    if eligible and not was and key not in self._shadow_attempted:
+                        self._shadow_attempted.add(key)
+                        self._spawn_shadow(shadow, market, sig, ep)
         if stale_markets:
             close_episodes(market_ids=stale_markets, reason="stale_books")
         self.last_recalc_at = utcnow()
@@ -348,6 +436,7 @@ class RealtimeScanner:
             markets = markets[: kwargs["market_limit"]]
         self._index_markets(markets)
         self._record_run_stats(status="running")
+        start_strategy_runs()
         token_ids = list(self.token_to_market.keys())
         self.ws = MarketWebsocketClient(
             self._on_ws,
@@ -387,6 +476,7 @@ class RealtimeScanner:
                         logger.exception("Live market resync failed")
         finally:
             self._running = False
+            finish_open_strategy_runs()
             await self._shutdown_paper_tasks()
             flush_latency()
             self._record_run_stats(status="stopped", finished=True)
