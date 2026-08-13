@@ -1,0 +1,27 @@
+version: 1
+disable_existing_loggers: false
+formatters:
+  structured:
+    format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    datefmt: "%Y-%m-%dT%H:%M:%S"
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: structured
+    stream: ext://sys.stdout
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: structured
+    filename: logs/scanner.log
+    maxBytes: 10485760
+    backupCount: 5
+root:
+  level: INFO
+  handlers: [console, file]
+loggers:
+  httpx:
+    level: WARNING
+  httpcore:
+    level: WARNING

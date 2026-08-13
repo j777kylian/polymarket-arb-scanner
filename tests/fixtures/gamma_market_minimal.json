@@ -1,0 +1,10 @@
+{
+  "id": "fixture-market-minimal",
+  "conditionId": "0xfixture",
+  "active": true,
+  "closed": false,
+  "acceptingOrders": true,
+  "enableOrderBook": true,
+  "clobTokenIds": "[\"111\",\"222\"]",
+  "outcomes": "[\"Yes\",\"No\"]"
+}

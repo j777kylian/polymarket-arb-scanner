@@ -1,0 +1,84 @@
+# Polymarket structural arb scanner — default configuration
+# READ-ONLY MODE — REAL TRADING DISABLED
+
+trading_enabled: false
+
+api:
+  gamma_url: "https://gamma-api.polymarket.com"
+  clob_url: "https://clob.polymarket.com"
+  geoblock_url: "https://polymarket.com/api/geoblock"
+  market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  http_timeout_seconds: 30.0
+  max_concurrent_requests: 8
+  retry_max_attempts: 5
+  retry_min_wait_seconds: 0.5
+  retry_max_wait_seconds: 30.0
+  market_page_limit: 100
+
+scanner:
+  mode: "static"
+  market_sync_interval_seconds: 300
+  orderbook_poll_interval_seconds: 45
+  max_data_age_seconds: 60
+  default_rule_set: "Balanced"
+  retention_days: 14
+  lock_file: "data/scanner.lock"
+  auto_daily_report: true
+  ws_ping_interval_seconds: 10
+  ws_subscribe_chunk: 200
+  ws_recalc_debounce_ms: 75
+  latency_sufficient_p50_ms: 200
+  latency_sufficient_p95_ms: 500
+
+paper:
+  enabled: false
+  starting_capital: "1000"
+  delay_ms: 500
+  time_in_force: "FAK"
+  first_leg: "YES"
+  force_close_unhedged: true
+  min_net_profit: "0.50"
+
+simulation:
+  default_profile: "base"
+  operational_cost: "0"
+  safety_buffer: "0.01"
+  profiles:
+    optimistic:
+      delay_ms: 0
+      slippage_ticks: 0
+      depth_factor: "1.0"
+      sequential_legs: false
+      partial_second_leg_ratio: "1.0"
+      force_close_unhedged: false
+    base:
+      delay_ms: 500
+      slippage_ticks: 1
+      depth_factor: "0.9"
+      sequential_legs: true
+      partial_second_leg_ratio: "1.0"
+      force_close_unhedged: false
+    pessimistic:
+      delay_ms: 2000
+      slippage_ticks: 2
+      depth_factor: "0.7"
+      sequential_legs: true
+      partial_second_leg_ratio: "0.5"
+      force_close_unhedged: true
+
+reporting:
+  timezone: "UTC"
+  report_hour_utc: 0
+  reports_dir: "reports"
+
+database:
+  url: "sqlite:///./data/scanner.db"
+
+logging:
+  level: "INFO"
+  dir: "logs"
+  file: "scanner.log"
+
+ui:
+  title: "Polymarket Structural Arb Scanner"
+  port: 8501

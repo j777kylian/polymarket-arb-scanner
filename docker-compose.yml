@@ -1,0 +1,49 @@
+services:
+  ui:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - DATABASE_URL=sqlite:///./data/scanner.db
+      - LOG_LEVEL=INFO
+      - TIMEZONE=UTC
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    read_only: false
+    user: "10001:10001"
+
+  scanner:
+    build: .
+    command: ["python", "scripts/run_scanner.py", "--daemon", "--mode", "static"]
+    environment:
+      - DATABASE_URL=sqlite:///./data/scanner.db
+      - LOG_LEVEL=INFO
+      - TIMEZONE=UTC
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    user: "10001:10001"
+
+  scanner-realtime:
+    build: .
+    profiles: ["realtime"]
+    command: ["python", "scripts/run_scanner.py", "--daemon", "--mode", "realtime", "--paper"]
+    environment:
+      - DATABASE_URL=sqlite:///./data/scanner.db
+      - LOG_LEVEL=INFO
+      - TIMEZONE=UTC
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    user: "10001:10001"
+    # Paper trading is local simulation only — no trading credentials
