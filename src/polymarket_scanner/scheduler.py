@@ -38,6 +38,22 @@ from polymarket_scanner.simulation.execution_simulator import simulate_all_profi
 
 logger = get_logger(__name__)
 
+CLOCK_SKEW_WARNING = (
+    "Host clock skew detected: feed event timestamps are ahead of local received_at. "
+    "Signed WS latency is not trustworthy; VPS latency is not sufficient."
+)
+
+
+def latency_sufficiency_label(stats: dict[str, Any]) -> str:
+    if stats.get("clock_skew_detected"):
+        return "clock skew"
+    suff = stats.get("latency_sufficient")
+    if suff is True:
+        return "sufficient"
+    if suff is False:
+        return "insufficient"
+    return "no WS samples"
+
 
 class ScannerService:
     def __init__(self) -> None:
@@ -148,6 +164,7 @@ class ScannerService:
         max_market_pages: int | None = None,
         market_limit: int | None = None,
         sync_markets: bool | None = None,
+        duration_seconds: float | None = None,
     ) -> None:
         assert_trading_disabled()
         setup_logging()
@@ -219,7 +236,21 @@ class ScannerService:
 
         report_task = asyncio.create_task(report_loop())
         try:
-            await rt.run()
+            if duration_seconds is None:
+                await rt.run()
+            else:
+                run_task = asyncio.create_task(rt.run())
+                try:
+                    # Shield so timeout cancels only the waiter; rt.run() exits via _running
+                    # and existing finally blocks still record stopped status / stop WS / paper / latency.
+                    await asyncio.wait_for(asyncio.shield(run_task), timeout=duration_seconds)
+                except TimeoutError:
+                    logger.info(
+                        "Live Research duration elapsed (%s seconds); stopping normally",
+                        duration_seconds,
+                    )
+                    rt._running = False
+                    await run_task
         finally:
             report_task.cancel()
             try:
@@ -297,12 +328,17 @@ def get_dashboard_stats() -> dict[str, Any]:
         lat_sorted = sorted(float(x) for x in lat_rows)
         p50 = p95 = None
         sufficient = None
+        clock_skew_detected = False
         if lat_sorted:
             p50 = lat_sorted[int(0.50 * (len(lat_sorted) - 1))]
             p95 = lat_sorted[int(0.95 * (len(lat_sorted) - 1))]
             cfg = get_config()
+            clock_skew_detected = any(
+                sample < -cfg.scanner.observed_delay_tolerance_ms for sample in lat_sorted
+            )
             sufficient = (
-                p50 <= cfg.scanner.latency_sufficient_p50_ms
+                not clock_skew_detected
+                and p50 <= cfg.scanner.latency_sufficient_p50_ms
                 and p95 <= cfg.scanner.latency_sufficient_p95_ms
             )
         qualified_today = session.scalar(
@@ -363,6 +399,7 @@ def get_dashboard_stats() -> dict[str, Any]:
             "latency_p50_ms": p50,
             "latency_p95_ms": p95,
             "latency_sufficient": sufficient,
+            "clock_skew_detected": clock_skew_detected,
             "paper_cash": cash,
             "paper_pnl": paper_realized,
             "paper_realized_pnl": paper_realized,

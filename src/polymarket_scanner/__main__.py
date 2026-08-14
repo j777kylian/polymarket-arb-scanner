@@ -12,10 +12,7 @@ from polymarket_scanner.safety import TRADING_ENABLED, assert_trading_disabled
 from polymarket_scanner.scheduler import ScannerService
 
 
-def main() -> None:
-    assert_trading_disabled()
-    setup_logging()
-    init_db()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polymarket structural arb scanner (read-only)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--daemon", action="store_true")
@@ -28,7 +25,30 @@ def main() -> None:
     parser.add_argument("--paper", action="store_true")
     parser.add_argument("--max-pages", type=int, default=None)
     parser.add_argument("--market-limit", type=int, default=None)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Live Research only: stop after N seconds and exit through normal cleanup "
+            "(omit to run indefinitely; 43200 = 12 hours)"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.duration_seconds is not None and args.duration_seconds <= 0:
+        parser.error("--duration-seconds must be a positive integer")
+    mode = normalize_scanner_mode(args.mode)
+    live = bool(args.daemon or mode == "live" or args.mode in {"live", "realtime"})
+    if args.duration_seconds is not None and not (live and not args.once):
+        parser.error("--duration-seconds is Live Research only")
+    return args
+
+
+def main() -> None:
+    assert_trading_disabled()
+    setup_logging()
+    init_db()
+    args = parse_args()
     print(f"READ-ONLY MODE — TRADING_ENABLED={TRADING_ENABLED}")
     service = ScannerService()
     mode = normalize_scanner_mode(args.mode)
@@ -41,6 +61,7 @@ def main() -> None:
                 paper=paper,
                 max_market_pages=args.max_pages,
                 market_limit=args.market_limit,
+                duration_seconds=args.duration_seconds,
             )
         )
         return

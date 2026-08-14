@@ -7,10 +7,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func, select
+
 from polymarket_scanner.api.clob_client import _parse_book_timestamp
 from polymarket_scanner.api.market_ws import MarketWebsocketClient, diff_tokens
 from polymarket_scanner.config import AppConfig, get_config
-from polymarket_scanner.database import ScannerRunRow, session_scope, utcnow
+from polymarket_scanner.database import (
+    ApiErrorRow,
+    OpportunityRow,
+    ScannerRunRow,
+    session_scope,
+    utcnow,
+)
 from polymarket_scanner.discovery.book_cache import LiveBookCache
 from polymarket_scanner.discovery.market_discovery import discover_and_store_markets
 from polymarket_scanner.discovery.orderbook_collector import persist_orderbook
@@ -111,9 +119,29 @@ class RealtimeScanner:
             row.discovered_markets = self.discovered_markets
             row.subscribed_markets = len(self.markets)
             row.subscribed_tokens = len(self.token_to_market)
-            row.ready_market_pairs = self.cache.ready_pair_count(self.markets)
+            ready_pairs = self.cache.ready_pair_count(self.markets)
+            row.ready_market_pairs = ready_pairs
+            # Paired-book meaning matches snapshot scanner books_fetched.
+            row.books_fetched = ready_pairs
             row.fee_schedule_coverage = self._fee_coverage()
             row.markets_synced = len(self.markets)
+            started = row.started_at
+            row.signals_found = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(OpportunityRow)
+                    .where(OpportunityRow.discovered_at >= started)
+                )
+                or 0
+            )
+            row.api_errors = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(ApiErrorRow)
+                    .where(ApiErrorRow.created_at >= started)
+                )
+                or 0
+            )
             if finished:
                 row.finished_at = utcnow()
 
@@ -163,7 +191,7 @@ class RealtimeScanner:
         payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else event
         ts = _parse_book_timestamp(payload.get("timestamp") or event.get("timestamp"))
         if ts is not None:
-            latency_ms = max(0.0, (received - ts).total_seconds() * 1000.0)
+            latency_ms = (received - ts).total_seconds() * 1000.0
             if latency_ms < 60_000:
                 from polymarket_scanner.scanners.pipeline import (
                     FEED_LATENCY_EVENTS,
