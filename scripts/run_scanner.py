@@ -11,10 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from polymarket_scanner.config import normalize_scanner_mode
-from polymarket_scanner.logging_config import setup_logging
-from polymarket_scanner.safety import assert_trading_disabled
-from polymarket_scanner.scheduler import ScannerService
+from polymarket_scanner.config import normalize_scanner_mode  # noqa: E402
+from polymarket_scanner.logging_config import setup_logging  # noqa: E402
+from polymarket_scanner.safety import assert_trading_disabled  # noqa: E402
+from polymarket_scanner.scheduler import ScannerService  # noqa: E402
 
 
 def main() -> None:
