@@ -73,6 +73,9 @@ python scripts/run_scanner.py --once --max-pages 2 --market-limit 50
 # Live Research — public WebSocket. Execution Mode: Observe Only (default) or Paper Trading
 python scripts/run_scanner.py --daemon --mode live
 python scripts/run_scanner.py --daemon --mode live --paper --max-pages 1 --market-limit 50
+
+# Bounded 12-hour paper run (43200 seconds); exits through normal cleanup
+python scripts/run_scanner.py --daemon --mode live --paper --duration-seconds 43200
 ```
 
 Daily report:

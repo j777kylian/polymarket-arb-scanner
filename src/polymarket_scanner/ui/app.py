@@ -43,7 +43,11 @@ from polymarket_scanner.scanners.rule_engine import (
     load_rule_sets_from_db,
     save_rule_set,
 )
-from polymarket_scanner.scheduler import get_dashboard_stats
+from polymarket_scanner.scheduler import (
+    CLOCK_SKEW_WARNING,
+    get_dashboard_stats,
+    latency_sufficiency_label,
+)
 from polymarket_scanner.simulation.execution_simulator import simulate_forward
 from polymarket_scanner.simulation.scenario_profiles import ScenarioProfile
 from polymarket_scanner.ui.scanner_control import (
@@ -153,11 +157,12 @@ def _render_metrics(stats: dict) -> None:
     p95 = stats.get("latency_p95_ms")
     l2.metric("WS latency p50 (ms)", f"{p50:.1f}" if p50 is not None else "n/a")
     l3.metric("WS latency p95 (ms)", f"{p95:.1f}" if p95 is not None else "n/a")
-    suff = stats.get("latency_sufficient")
     l4.metric(
         "VPS latency vs 500ms paper delay",
-        "sufficient" if suff else ("insufficient" if suff is False else "no WS samples"),
+        latency_sufficiency_label(stats),
     )
+    if stats.get("clock_skew_detected"):
+        st.warning(CLOCK_SKEW_WARNING)
     st.write(
         f"**Paper cash:** {stats.get('paper_cash')} · **realized PnL (paper):** "
         f"{stats.get('paper_pnl')} · **paper trades:** {stats.get('paper_trades')}"
